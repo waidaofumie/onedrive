@@ -1,0 +1,59 @@
+@startuml
+title isItemSynced()
+start
+
+if (Local path exists?) then (no)
+  :Return false;
+  stop
+endif
+
+if (Item is file or remote file?) then (yes)
+  if (Local file can be read?) then (no)
+    :Return false;
+    stop
+  endif
+
+  :Read local mtime and item mtime;
+  :Reduce timestamp comparison to whole seconds;
+  if (Timestamps equal?) then (yes)
+    :Return true;
+    note right
+      Some callers perform an additional hash guard
+      when DB identity is not yet trusted, such as
+      potentially-new items during ~--resync.
+    end note
+    stop
+  endif
+
+  :Compute / compare content hash because timestamps differ;
+  if (Hash differs?) then (yes)
+    :Return false;
+    stop
+  else (no)
+    :Content matches; reconcile timestamp authority;
+    if (Local timestamp newer?) then (yes)
+      if (~--download-only or ~--resync?) then (yes)
+        :Correct local timestamp from item metadata;
+      else (no)
+        :Correct online timestamp from local metadata;
+      endif
+    else (no)
+      :Correct local timestamp from item metadata;
+    endif
+    :Return false so caller can complete\npost-correction handling;
+    stop
+  endif
+else (no)
+  if (Item is directory or remote directory?) then (yes)
+    :Return true;
+    note right
+      Current implementation treats existence as sufficient here;
+      directory type validation is handled by surrounding logic.
+    end note
+    stop
+  else (unknown / none)
+    :Return true;
+    stop
+  endif
+endif
+@enduml

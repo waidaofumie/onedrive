@@ -1,102 +1,697 @@
+// What is this module called?
+module util;
+
+// What does this module require to function?
+import core.memory;
+import core.stdc.errno : ENOENT, EINTR, EBUSY, EXDEV, EAGAIN, EPERM, EACCES, EROFS;
+import core.stdc.stdlib;
+import core.stdc.string;
+import core.sys.posix.pwd;
+import core.sys.posix.signal;
+import core.sys.posix.sys.resource;
+import core.sys.posix.sys.stat;
+import core.sys.posix.unistd;
+import core.thread;
+import core.time : Duration, MonoTime, dur;
+import etc.c.curl;
+import std.algorithm;
+import std.array;
+import std.ascii;
 import std.base64;
 import std.conv;
-import std.digest.crc, std.digest.sha;
-import std.net.curl;
 import std.datetime;
+import std.digest.crc;
+import std.digest.sha;
+import std.exception;
 import std.file;
+import std.format;
+import std.json;
+import std.math;
+import std.net.curl;
 import std.path;
+import std.process;
+import std.random;
+import std.range;
 import std.regex;
 import std.socket;
 import std.stdio;
 import std.string;
-import std.algorithm;
-import std.uri;
-import std.json;
 import std.traits;
+import std.typecons : Yes;
+import std.uri;
+import std.utf;
+
+// What other modules that we have created do we need to import?
+import log;
+import config;
 import qxor;
-import core.stdc.stdlib;
-static import log;
+import curlEngine;
 
-shared string deviceName;
+// Global variable for the device name
+__gshared string deviceName;
+// Global flag for SIGINT (CTRL-C) and SIGTERM (kill) state
+__gshared bool exitHandlerTriggered = false;
+// Global flag to indicate file transfers are occurring
+__gshared bool fileTransferInProgress = false;
 
-static this()
-{
+// Application exit code used when the local state requires a mandatory --resync.
+// Use the traditional EX_CONFIG status value so callers can distinguish it from a generic failure.
+const int EXIT_RESYNC_REQUIRED = 78;
+
+// util module variable
+ulong previousRSS;
+
+version (OpenBSD) {
+	// OpenBSD libc sysctl(2) declaration for native process telemetry.
+	// Keep this at module scope so D links against libc's C symbol `sysctl`.
+	extern(C) int sysctl(const(int)* name, uint namelen, void* oldp, size_t* oldlenp, void* newp, size_t newlen);
+}
+
+struct DesktopHints {
+	bool gnome;
+	bool kde;
+}
+
+shared static this() {
 	deviceName = Socket.hostName;
 }
 
-// gives a new name to the specified file or directory
-void safeRename(const(char)[] path)
-{
-	auto ext = extension(path);
-	auto newPath = path.chomp(ext) ~ "-" ~ deviceName;
-	if (exists(newPath ~ ext)) {
-		int n = 2;
-		char[] newPath2;
-		do {
-			newPath2 = newPath ~ "-" ~ n.to!string;
-			n++;
-		} while (exists(newPath2 ~ ext));
-		newPath = newPath2;
+// To assist with filesystem severity issues, configure an enum that can be used
+enum FsErrorSeverity {
+	warning,
+	error,
+	fatal,
+	permission
+}
+
+// Find an already-published safeBackup from this device whose bytes still match
+// the supplied canonical file. Replacement workflows can reuse that preservation
+// rather than generating another numbered copy after a retry or later reconciliation.
+bool findMatchingSafeBackup(const(char)[] path, out string matchingBackupPath) {
+	matchingBackupPath = null;
+	if (!exists(path)) return false;
+
+	const string spath = to!string(path);
+	const string ext = extension(spath);
+	const size_t stemLen = spath.length >= ext.length ? spath.length - ext.length : spath.length;
+	string stem = spath[0 .. stemLen];
+	string tag = "-" ~ deviceName ~ "-safeBackup-";
+	string baseStem = stem;
+
+	// Mirror safeBackup() naming when the input is itself one of this device's
+	// safeBackup files, so we search the same numbered family.
+	if (stem.length >= tag.length + 4) {
+		auto last4 = stem[$ - 4 .. $];
+		auto tagSpan = stem[$ - (tag.length + 4) .. $ - 4];
+		bool fourDigits = true;
+		foreach (c; last4) {
+			if (!c.isDigit) { fourDigits = false; break; }
+		}
+		if (fourDigits && tagSpan == tag) {
+			baseStem = stem[0 .. $ - (tag.length + 4)];
+		}
 	}
-	newPath ~= ext;
-	rename(path, newPath);
-}
 
-// deletes the specified file without throwing an exception if it does not exists
-void safeRemove(const(char)[] path)
-{
-	if (exists(path)) remove(path);
-}
-
-// returns the crc32 hex string of a file
-string computeCrc32(string path)
-{
-	CRC32 crc;
-	auto file = File(path, "rb");
-	foreach (ubyte[] data; chunks(file, 4096)) {
-		crc.put(data);
+	ulong canonicalSize;
+	SysTime canonicalModifiedTime;
+	uint canonicalAttributes;
+	try {
+		canonicalSize = getSize(spath);
+		canonicalModifiedTime = timeLastModified(spath);
+		canonicalAttributes = getAttributes(spath);
+	} catch (FileException e) {
+		if (debugLogging) {
+			addLogEntry("Unable to inspect canonical file while checking existing safeBackup files for " ~ spath ~ ": " ~ e.msg, ["debug"]);
+		}
+		return false;
 	}
-	return crc.finish().toHexString().dup;
-}
 
-// returns the sha1 hash hex string of a file
-string computeSha1Hash(string path)
-{
-	SHA1 sha;
-	auto file = File(path, "rb");
-	foreach (ubyte[] data; chunks(file, 4096)) {
-		sha.put(data);
+	string parentPath = dirName(spath);
+	string expectedPrefix = baseName(baseStem) ~ tag;
+	string[] candidatePaths;
+	try {
+		foreach (entry; dirEntries(parentPath, SpanMode.shallow)) {
+			if (!entry.isFile) continue;
+			string entryName = baseName(entry.name);
+			if (!entryName.startsWith(expectedPrefix) || !entryName.endsWith(ext)) continue;
+
+			size_t suffixEnd = entryName.length - ext.length;
+			if (suffixEnd != expectedPrefix.length + 4) continue;
+			auto digits = entryName[expectedPrefix.length .. suffixEnd];
+			bool fourDigits = true;
+			foreach (c; digits) {
+				if (!c.isDigit) { fourDigits = false; break; }
+			}
+			if (!fourDigits) continue;
+
+			string candidatePath = entry.name;
+			// dirEntries() can return a path with a different textual prefix (for
+			// example "./file") than the input. Because this scan is restricted to
+			// one parent directory, matching basenames identify the same entry.
+			if (entryName == baseName(spath)) continue;
+			if (getSize(candidatePath) != canonicalSize) continue;
+			if (timeLastModified(candidatePath) != canonicalModifiedTime) continue;
+			if (getAttributes(candidatePath) != canonicalAttributes) continue;
+			candidatePaths ~= candidatePath;
+		}
+	} catch (FileException e) {
+		if (debugLogging) {
+			addLogEntry("Unable to inspect existing safeBackup files for " ~ spath ~ ": " ~ e.msg, ["debug"]);
+		}
+		return false;
 	}
-	return sha.finish().toHexString().dup;
+
+	// Avoid hashing the canonical file at all when there is no plausible
+	// same-device safeBackup to reuse. This is the common first-preservation path.
+	if (candidatePaths.empty) return false;
+
+	string canonicalHash = computeQuickXorHash(spath);
+	if (canonicalHash.empty) return false;
+
+	// The four-digit counter is zero-padded, so descending lexical order checks
+	// the most recently numbered backup first. This avoids hashing a long history
+	// of large backups on the common retry path.
+	sort!("a > b")(candidatePaths);
+	foreach (candidatePath; candidatePaths) {
+		if (computeQuickXorHash(candidatePath) != canonicalHash) continue;
+
+		// Recheck the source after hashing the candidate. If it changed during
+		// this comparison, do not reuse a stale preservation snapshot.
+		if (computeQuickXorHash(spath) != canonicalHash) return false;
+		matchingBackupPath = candidatePath;
+		return true;
+	}
+
+	return false;
 }
 
-// returns the quickXorHash base64 string of a file
-string computeQuickXorHash(string path)
-{
+// Creates a safe backup of the given item, and only performs the function if not in a --dry-run scenario.
+// If the path already ends with "-<deviceName>-safeBackup-####", the counter is incremented
+// instead of appending another "-<deviceName>-safeBackup-".
+void safeBackup(const(char)[] path, bool dryRun, bool bypassDataPreservation, out string renamedPath, bool retainOriginalPath = false, bool allowHardLinkPreservation = true) {
+	// Ensure this is currently null
+	renamedPath = null;
+	bool isDirectory = false;
+	
+	// If the path doesn’t exist, there is nothing to back up
+	if (!exists(path)) {
+		if (debugLogging) {
+			addLogEntry("safeBackup: Skipping backup as local path does not exist: " ~ to!string(path), ["debug"]);
+		}
+		return;
+	}
+
+	// Is the path a directory?
+	try {
+		isDirectory = isDir(path);
+	} catch (FileException e) {
+		// Path disappeared or became inaccessible between exists() and isDir()
+		if (verboseLogging) {
+			addLogEntry("Path to backup no longer exists or is inaccessible: " ~ to!string(path) ~ " : " ~ e.msg, ["verbose"]);
+		}
+		// Nothing left to back up — exit safely
+		return;
+	}
+	
+	// Is the input path a folder|directory? These should never be renamed
+	if (isDirectory) {
+		if (verboseLogging) {
+			addLogEntry("safeBackup request of local directory is being ignored: " ~ to!string(path), ["verbose"]);
+		}
+		return;
+	}
+	
+	// Has the user configured to IGNORE local data protection rules?
+	if (bypassDataPreservation) {
+		addLogEntry("WARNING: Local Data Protection has been disabled - not creating a safeBackup. You may experience data loss on this file: " ~ to!string(path), ["info", "notify"]);
+		return;
+	}
+	
+	// Convert once for convenience
+	const string spath = to!string(path);
+	const string ext   = extension(spath);
+
+	// Compute stem without extension (handles no-extension case too)
+	const size_t stemLen = spath.length >= ext.length ? spath.length - ext.length : spath.length;
+	string stem = spath[0 .. stemLen];
+
+	// Tag used for our safe backups
+	string tag = "-" ~ deviceName ~ "-safeBackup-";
+
+	// Detect if already a tagged safeBackup on THIS device; if so, bump the 4-digit counter
+	int startN = 1;
+	string baseStem = stem;
+
+	if (stem.length >= tag.length + 4) {
+		// Slice out last 4 chars and the tag position
+		auto last4   = stem[$ - 4 .. $];
+		auto tagSpan = stem[$ - (tag.length + 4) .. $ - 4];
+
+		bool fourDigits = true;
+		foreach (c; last4) {
+			if (!c.isDigit) { fourDigits = false; break; }
+		}
+
+		if (fourDigits && tagSpan == tag) {
+			// Already a backup from this device — bump the counter
+			startN   = to!int(last4) + 1;
+			baseStem = stem[0 .. $ - (tag.length + 4)];
+		}
+	}
+
+	// Find the first available name, capped at 1000 attempts. Replacement
+	// preservation reserves a filtered .partial staging name for the verified-copy
+	// fallback so an interrupted fallback cannot look like a valid safeBackup.
+	int n = startN;
+	string candidate;
+	string copyStagingPath;
+
+	while (n <= 1000) {
+		candidate = baseStem ~ tag ~ format("%04d", n) ~ ext;
+		copyStagingPath = candidate ~ ".partial";
+		if (!exists(candidate) && (!retainOriginalPath || !exists(copyStagingPath))) break;
+		++n;
+	}
+
+	// If we exhausted our attempts, fail out
+	if (n > 1000) {
+		addLogEntry("Failed to backup " ~ spath ~ ": Unique file name could not be found after 1000 attempts", ["error"]);
+		return;
+	}
+
+	// Log intent
+	if (verboseLogging) {
+		string preservationAction = retainOriginalPath ? "preserving" : "renaming";
+		addLogEntry("The local item is out-of-sync with OneDrive, " ~ preservationAction ~ " to preserve existing file and prevent local data loss: " ~ spath ~ " -> " ~ candidate, ["verbose"]);
+	}
+
+	// Perform (or simulate) the preservation operation. The one deliberate
+	// remote-delete preservation path retains the historical rename behaviour.
+	// Replacement/conflict workflows keep the canonical pathname present.
+	if (!dryRun) {
+		if (retainOriginalPath) {
+			if (allowHardLinkPreservation) {
+				// Prefer a POSIX hard link when the canonical pathname is about to be
+				// atomically displaced. The safeBackup is created in the same directory as
+				// the canonical file, so this preserves the exact existing inode and its
+				// metadata without copying file data or requiring another file's worth of
+				// free space. If the filesystem refuses hard links, fall back to the
+				// verified independent-copy path below.
+				if (link(spath.toStringz, candidate.toStringz) == 0) {
+					renamedPath = candidate;
+					if (debugLogging) {
+						addLogEntry("Created local safeBackup using POSIX hard-link preservation: " ~ spath ~ " -> " ~ candidate, ["debug"]);
+					}
+					return;
+				}
+
+				// link() is atomic with respect to creation of the destination entry. If
+				// another actor created the selected name after our availability check, do
+				// not let the copy fallback overwrite it. A later reconciliation can select
+				// the next numbered safeBackup safely.
+				if (exists(candidate) || exists(copyStagingPath)) {
+					addLogEntry("Creating local safeBackup failed because the selected backup path became occupied: " ~ candidate, ["error"]);
+					return;
+				}
+
+				if (debugLogging) {
+					addLogEntry("POSIX hard-link preservation was unavailable; falling back to a verified safeBackup copy: " ~ spath ~ " -> " ~ candidate, ["debug"]);
+				}
+			} else if (debugLogging) {
+				// Upload-conflict preservation must be an independent snapshot. Leaving
+				// canonical and safeBackup hard-linked while one copy is uploaded (or while
+				// --upload-only keeps both paths) would allow later edits to mutate both.
+				addLogEntry("Creating an independent verified safeBackup copy because this preservation must remain stable while the canonical file remains active: " ~ spath, ["debug"]);
+			}
+
+			try {
+				// Keep the canonical file in place while creating the fallback copy.
+				// Write to a filtered staging name first so a process interruption can
+				// never leave incomplete bytes carrying a valid-looking safeBackup name.
+				std.file.copy(spath, copyStagingPath, Yes.preserveAttributes);
+
+				// A source file can be edited while a large copy is in progress. Verify
+				// that the completed staging copy still represents the current canonical
+				// bytes; otherwise abort preservation rather than publishing a torn backup.
+				string stagedHash = computeQuickXorHash(copyStagingPath);
+				string canonicalHash = computeQuickXorHash(spath);
+				if (stagedHash.empty || canonicalHash.empty || (stagedHash != canonicalHash)) {
+					safeRemove(copyStagingPath);
+					addLogEntry("Creating local safeBackup copy aborted because the canonical file changed while it was being preserved: " ~ spath, ["error", "notify"]);
+					return;
+				}
+
+				// Publish the verified backup name only after the fallback copy is complete.
+				if (safeRename(copyStagingPath, candidate, false)) {
+					renamedPath = candidate;
+				} else {
+					safeRemove(copyStagingPath);
+					addLogEntry("Publishing local safeBackup copy failed for " ~ spath ~ " -> " ~ candidate, ["error"]);
+				}
+			} catch (FileException e) {
+				// Never leave an incomplete staging artifact after a handled failure.
+				safeRemove(copyStagingPath);
+				displayFileSystemErrorMessage(e.msg, format("%s.%s", strip(__MODULE__), strip(getFunctionName!({}))), "sourcePath=" ~ spath ~ " backupPath=" ~ candidate);
+				addLogEntry("Creating local safeBackup copy failed for " ~ spath ~ " -> " ~ candidate, ["error"]);
+			}
+		} else {
+			// Historical behaviour: rename the local file to create the safe backup.
+			if (safeRename(spath, candidate, dryRun)) {
+				renamedPath = candidate;
+			} else {
+				addLogEntry("Renaming of local file failed for " ~ spath ~ " -> " ~ candidate, ["error"]);
+			}
+		}
+	} else {
+		if (debugLogging) {
+			string dryRunAction = retainOriginalPath ? "preserving" : "renaming";
+			addLogEntry("DRY-RUN: Skipping " ~ dryRunAction ~ " local file to preserve existing file and prevent data loss: " ~ spath ~ " -> " ~ candidate, ["debug"]);
+		}
+	}
+}
+
+// Rename the given item, and only performs the function if not in a --dry-run scenario
+bool safeRename(const(char)[] oldPath, const(char)[] newPath, bool dryRun) {
+	string thisFunctionName = format("%s.%s", strip(__MODULE__), strip(getFunctionName!({})));
+
+	if (dryRun) {
+		if (debugLogging) { addLogEntry("DRY-RUN: Skipping local file rename", ["debug"]); }
+		return true;
+	}
+
+	int maxAttempts = 5;
+
+	foreach (attempt; 0 .. maxAttempts) {
+		try {
+			if (debugLogging) { addLogEntry("Calling rename(oldPath, newPath)", ["debug"]); }
+			
+			// There are 2 options to rename a file
+			// rename() - https://dlang.org/library/std/file/rename.html
+			// std.file.copy() - https://dlang.org/library/std/file/copy.html
+			//
+			// rename:
+			//   It is not possible to rename a file across different mount points or drives. On POSIX, the operation is atomic. That means, if to already exists there will be no time period during the operation where to is missing.
+			//
+			// std.file.copy
+			//   Copy file from to file to. File timestamps are preserved. File attributes are preserved, if preserve equals Yes.preserveAttributes
+			//
+			// Use rename() as Linux is POSIX compliant, we have an atomic operation where at no point in time the 'to' is missing.
+						
+			rename(oldPath, newPath);
+			return true;
+		} catch (FileException e) {
+			// Retry on EINTR
+			if (e.errno == EINTR) {        // Interrupted by signal → retry
+				// 10ms backoff to avoid spinning if signals are frequent
+				Thread.sleep(dur!"msecs"(10 * (attempt + 1)));
+				continue;
+			}
+			// Retry on EBUSY
+			if (e.errno == EBUSY) {        // Filesystem was busy → retry
+				// 25ms backoff to avoid spinning if signals are frequent
+				Thread.sleep(dur!"msecs"(25 * (attempt + 1)));
+				continue;
+			}
+			// Cross-device rename: not retryable
+			if (e.errno == EXDEV) {
+				displayFileSystemErrorMessage("Rename failed (cross-filesystem): " ~ e.msg, thisFunctionName, "oldPath=" ~ to!string(oldPath) ~ " newPath=" ~ to!string(newPath));
+				return false;
+			}
+			// Everything else: log once and return
+			displayFileSystemErrorMessage(e.msg, thisFunctionName, "oldPath=" ~ to!string(oldPath) ~ " newPath=" ~ to!string(newPath));
+			return false;
+		}
+	}
+
+	// If we get here, we exhausted retries
+	// Log the last failure
+	displayFileSystemErrorMessage("Failed to rename after retries: ", thisFunctionName, "oldPath=" ~ to!string(oldPath) ~ " newPath=" ~ to!string(newPath));
+	return false;
+}
+
+// Deletes the specified file without throwing an exception if there is an issue
+void safeRemove(const(char)[] path) {
+	string thisFunctionName = format("%s.%s", strip(__MODULE__), strip(getFunctionName!({})));
+
+	int maxAttempts = 5;
+
+	foreach (attempt; 0 .. maxAttempts) {
+		try {
+			// Attempt to remove; no pre-check to avoid TOCTTOU
+			remove(path);
+			return;
+		} catch (FileException e) {
+			if (e.errno == ENOENT) return; // already gone → fine
+			// Retry on EINTR
+			if (e.errno == EINTR) {        // Interrupted by signal → retry
+				// 10ms backoff to avoid spinning if signals are frequent
+				Thread.sleep(dur!"msecs"(10 * (attempt + 1)));
+				continue;
+			}
+			// Retry on EBUSY
+			if (e.errno == EBUSY) {        // Filesystem was busy → retry
+				// 25ms backoff to avoid spinning if signals are frequent
+				Thread.sleep(dur!"msecs"(25 * (attempt + 1)));
+				continue;
+			}
+			// Anything else is noteworthy (EISDIR, EACCES, etc.)
+			displayFileSystemErrorMessage(e.msg, thisFunctionName, to!string(path));
+			return;
+		}
+	}
+	// If we get here, we exhausted retries
+	// Log the last failure
+	displayFileSystemErrorMessage("Failed to remove file after retries: " ~ to!string(path), thisFunctionName, to!string(path));
+}
+
+// Returns the quickXorHash base64 string of a file, or an empty string on failure
+string computeQuickXorHash(string path) {
+
 	QuickXor qxor;
-	auto file = File(path, "rb");
-	foreach (ubyte[] data; chunks(file, 4096)) {
-		qxor.put(data);
+	File file;
+	bool fileOpened = false;
+
+	scope(exit) {
+		if (fileOpened) {
+			file.close();
+		}
 	}
-	return Base64.encode(qxor.finish());
+
+	try {
+		// Open file for reading
+		file = File(path, "rb");
+		fileOpened = true;
+
+		// Single stat call for BOTH size and preferred block size
+		ulong fs = 0;
+		size_t blockSize = 4096; // sensible default
+
+		try {
+			auto de = DirEntry(path);
+			auto st = de.statBuf; // POSIX stat struct inferred
+
+			if (st.st_size > 0)
+				fs = cast(ulong) st.st_size;
+
+			if (st.st_blksize > 0)
+				blockSize = cast(size_t) st.st_blksize;
+		} catch (Exception e) {
+			// Best-effort only; keep defaults if stat fails
+			addLogEntry("Unexpected error while stat'ing file for hash sizing: " ~ path ~ " - " ~ e.msg);
+		}
+
+		// Choose factor based on file size
+		size_t factor;
+		if (fs == 0) {
+			factor = 256;                                  // unknown size -> moderate buffer
+		} else if (fs < 1_048_576UL) {                     // < 1 MiB
+			factor = 16;                                   // small buffer
+		} else if (fs < 1_073_741_824UL) {                 // < 1 GiB
+			factor = 256;                                  // medium buffer
+		} else {                                           // >= 1 GiB
+			factor = 512;                                  // larger buffer
+		}
+
+		// Compute bufSize and clamp to [64 KiB, 8 MiB]
+		size_t bufSize = blockSize * factor;
+
+		if (bufSize < 64 * 1024)
+			bufSize = 64 * 1024;
+		if (bufSize > 8 * 1024 * 1024)
+			bufSize = 8 * 1024 * 1024;
+
+		// Allocate outside GC to avoid scanning big buffers
+		auto raw = cast(ubyte*) malloc(bufSize);
+		if (raw is null) {
+			addLogEntry("Failed to compute QuickXor Hash for file: " ~ path ~ " - out of memory allocating buffer");
+			return "";
+		}
+		scope(exit) free(raw);
+
+		ubyte[] buf = raw[0 .. bufSize];
+
+		// Large sequential reads, minimal syscall overhead
+		for (;;) {
+			auto chunk = file.rawRead(buf);   // returns slice of bytes read
+			if (chunk.length == 0) break;     // EOF
+			qxor.put(chunk);
+		}
+
+	} catch (ErrnoException e) {
+		addLogEntry("Failed to compute QuickXor Hash for file: " ~ path ~ " - " ~ e.msg);
+		return "";
+	} catch (Exception e) {
+		addLogEntry("Unexpected error while computing QuickXor Hash for file: " ~ path ~ " - " ~ e.msg);
+		return "";
+	}
+
+	auto hashResult = qxor.finish();
+	return Base64.encode(hashResult).idup;
 }
 
-// converts wildcards (*, ?) to regex
-Regex!char wild2regex(const(char)[] pattern)
-{
+// Returns the SHA256 hash hex string of a file, or an empty string on failure
+string computeSHA256Hash(string path) {
+
+	SHA256 sha256;
+	File file;
+	bool fileOpened = false;
+
+	scope(exit) {
+		if (fileOpened) {
+			file.close();
+		}
+	}
+
+	try {
+		// Open file for reading
+		file = File(path, "rb");
+		fileOpened = true;
+
+		// Single stat call for BOTH size and preferred block size
+		ulong fs = 0;
+		size_t blockSize = 4096; // sensible default
+
+		try {
+			auto de = DirEntry(path);
+			auto st = de.statBuf; // POSIX stat struct inferred
+
+			if (st.st_size > 0)
+				fs = cast(ulong) st.st_size;
+
+			if (st.st_blksize > 0)
+				blockSize = cast(size_t) st.st_blksize;
+		} catch (Exception e) {
+			// Best-effort only; keep defaults if stat fails
+			addLogEntry("Unexpected error while stat'ing file for hash sizing: " ~ path ~ " - " ~ e.msg);
+		}
+
+		// Choose factor based on file size
+		size_t factor;
+		if (fs == 0) {
+			factor = 256;                                  // unknown size -> moderate buffer
+		} else if (fs < 1_048_576UL) {                     // < 1 MiB
+			factor = 16;                                   // small buffer
+		} else if (fs < 1_073_741_824UL) {                 // < 1 GiB
+			factor = 256;                                  // medium buffer
+		} else {                                           // >= 1 GiB
+			factor = 512;                                  // larger buffer
+		}
+
+		// Compute bufSize and clamp to [64 KiB, 8 MiB]
+		size_t bufSize = blockSize * factor;
+
+		if (bufSize < 64 * 1024)
+			bufSize = 64 * 1024;
+		if (bufSize > 8 * 1024 * 1024)
+			bufSize = 8 * 1024 * 1024;
+
+		// Allocate outside GC to avoid scanning big buffers
+		auto raw = cast(ubyte*) malloc(bufSize);
+		if (raw is null) {
+			addLogEntry("Failed to compute SHA256 Hash for file: " ~ path ~ " - out of memory allocating buffer");
+			return "";
+		}
+		scope(exit) free(raw);
+
+		ubyte[] buf = raw[0 .. bufSize];
+
+		// Large sequential reads, minimal syscall overhead
+		for (;;) {
+			auto chunk = file.rawRead(buf);   // returns slice of bytes read
+			if (chunk.length == 0) break;     // EOF
+			sha256.put(chunk);
+		}
+
+	} catch (ErrnoException e) {
+		addLogEntry("Failed to compute SHA256 Hash for file: " ~ path ~ " - " ~ e.msg);
+		return "";
+	} catch (Exception e) {
+		addLogEntry("Unexpected error while computing SHA256 Hash for file: " ~ path ~ " - " ~ e.msg);
+		return "";
+	}
+
+	auto hashResult = sha256.finish();
+	return toHexString(hashResult).idup;
+}
+
+struct QuickXorStreamHasher {
+	private QuickXor qxor;
+	private bool started;
+
+	void start() nothrow @safe {
+		qxor.start();
+		started = true;
+	}
+
+	void update(scope const(ubyte)[] chunk) nothrow @safe {
+		if (!started) start();
+		qxor.put(chunk);
+	}
+
+	// Returns base64-encoded quickXorHash (Graph format)
+	string finishB64() {
+		auto hashResult = qxor.finish();         // ubyte[20]
+		return Base64.encode(hashResult).idup;   // allocates
+	}
+}
+
+struct SHA256StreamHasher {
+	private SHA256 sha256;
+	private bool started;
+
+	void start() nothrow @safe {
+		sha256.start();   // supported by std.digest digests
+		started = true;
+	}
+
+	void update(scope const(ubyte)[] chunk) nothrow @safe {
+		if (!started) start();
+		sha256.put(chunk);
+	}
+
+	// Returns lower-case hex string of SHA-256 digest
+	string finishHex() {
+		auto hashResult = sha256.finish();      // ubyte[32]
+		return toHexString(hashResult).idup;    // allocates
+	}
+}
+
+// Converts wildcards (*, ?) to regex
+// The changes here need to be 100% regression tested before full release
+Regex!char wild2regex(const(char)[] pattern) {
 	string str;
 	str.reserve(pattern.length + 2);
 	str ~= "^";
 	foreach (c; pattern) {
 		switch (c) {
 		case '*':
-			str ~= "[^/]*";
+			str ~= ".*";  // Changed to match any character. Was:      str ~= "[^/]*";
 			break;
 		case '.':
 			str ~= "\\.";
 			break;
 		case '?':
-			str ~= "[^/]";
+			str ~= ".";  // Changed to match any single character. Was:    str ~= "[^/]";
 			break;
 		case '|':
 			str ~= "$|^";
@@ -105,8 +700,8 @@ Regex!char wild2regex(const(char)[] pattern)
 			str ~= "\\+";
 			break;
 		case ' ':
-			str ~= "\\s+";
-			break;	
+			str ~= "\\s";  // Changed to match exactly one whitespace. Was:   str ~= "\\s+";
+			break;
 		case '/':
 			str ~= "\\/";
 			break;
@@ -115,6 +710,28 @@ Regex!char wild2regex(const(char)[] pattern)
 			break;
 		case ')':
 			str ~= "\\)";
+			break;
+		// '[', ']', '{', '}', '^' and '$' are valid characters in OneDrive file and folder names, so escape them to match them literally.
+		// Without escaping, 'Photos [2023]' becomes a character class (matching 'Photos 2' but not 'Photos [2023]'),
+		// 'Backup{1}.txt' becomes a repetition quantifier, '^' and '$' become anchors, and an unbalanced '[' or '{'
+		// throws a RegexException when the rule is loaded.
+		case '[':
+			str ~= "\\[";
+			break;
+		case ']':
+			str ~= "\\]";
+			break;
+		case '{':
+			str ~= "\\{";
+			break;
+		case '}':
+			str ~= "\\}";
+			break;
+		case '^':
+			str ~= "\\^";
+			break;
+		case '$':
+			str ~= "\\$";
 			break;
 		default:
 			str ~= c;
@@ -125,60 +742,243 @@ Regex!char wild2regex(const(char)[] pattern)
 	return regex(str, "i");
 }
 
-// returns true if the network connection is available
-bool testNetwork()
-{
-	// Use low level HTTP struct
-	auto http = HTTP();
-	http.url = "https://login.microsoftonline.com";
-	// DNS lookup timeout
-	http.dnsTimeout = (dur!"seconds"(5));
-	// Timeout for connecting
-	http.connectTimeout = (dur!"seconds"(5));
-	// HTTP connection test method
-	http.method = HTTP.Method.head;
-	// Attempt to contact the Microsoft Online Service
-	try {
-		log.vdebug("Attempting to contact online service");
-		http.perform();
-		log.vdebug("Shutting down HTTP engine as sucessfully reached OneDrive Online Service");
-		http.shutdown();
-		return true;
-	} catch (SocketException e) {
-		// Socket issue
-		log.vdebug("HTTP Socket Issue");
-		log.error("Cannot connect to Microsoft OneDrive Service - Socket Issue");
-		displayOneDriveErrorMessage(e.msg, getFunctionName!({}));
-		return false;
-	} catch (CurlException e) {
-		// No network connection to OneDrive Service
-		log.vdebug("No Network Connection");
-		log.error("Cannot connect to Microsoft OneDrive Service - Network Connection Issue");
-		displayOneDriveErrorMessage(e.msg, getFunctionName!({}));
-		return false;
-	}
+// Result of the lightweight Microsoft HTTPS service probe used for both
+// connectivity testing and process-visible system-time validation.
+struct MicrosoftServiceProbeResult {
+	bool reachable;
+	long httpStatusCode;
+	string serviceUrl;
+	string responseDateHeader;
+	SysTime requestStartUtc;
+	SysTime responseEndUtc;
+	MonoTime responseEndMonotonic;
+	Duration roundTripTime;
+	string failureReason;
 }
 
-// Can we read the file - as a permissions issue or file corruption will cause a failure
+// Return an HTTP response header without assuming how std.net.curl normalises
+// header-name casing.
+private string getHttpResponseHeaderCaseInsensitive(string[string] headers, string requestedHeader) {
+	foreach (headerName, headerValue; headers) {
+		if (icmp(headerName, requestedHeader) == 0) {
+			return headerValue;
+		}
+	}
+	return "";
+}
+
+// Probe the Microsoft identity endpoint using a minimal HTTPS HEAD request.
+//
+// This replaces the old boolean-only reachability observation with a structured
+// result. The same network request can therefore answer both questions:
+//   1. Can this process currently reach the applicable Microsoft cloud?
+//   2. If Microsoft supplied an HTTP Date header, how does service time compare
+//      with the wall clock visible to this process?
+MicrosoftServiceProbeResult probeMicrosoftService(ApplicationConfig appConfig, bool displayLogging = true) {
+	MicrosoftServiceProbeResult result;
+	result.serviceUrl = appConfig.getConfiguredMicrosoftAuthEndpoint();
+	result.requestStartUtc = SysTime.min;
+	result.responseEndUtc = SysTime.min;
+	result.failureReason = "not_attempted";
+
+	HTTP http = HTTP();
+	http.url = result.serviceUrl;
+	
+	// Configure timeouts based on application configuration
+	http.dnsTimeout = dur!"seconds"(appConfig.getValueLong("dns_timeout"));
+	http.connectTimeout = dur!"seconds"(appConfig.getValueLong("connect_timeout"));
+	http.dataTimeout = dur!"seconds"(appConfig.getValueLong("data_timeout"));
+	http.operationTimeout = dur!"seconds"(appConfig.getValueLong("operation_timeout"));
+
+	// Set IP protocol version
+	http.handle.set(CurlOption.ipresolve, appConfig.getValueLong("ip_protocol_version"));
+
+	// Explicitly set libcurl options to avoid using signal handlers in a multi-threaded environment
+	//   https://curl.se/libcurl/c/CURLOPT_NOSIGNAL.html
+	http.handle.set(CurlOption.nosignal,1);
+	
+	// Explicitly set the use of TCP NAGLE
+	//   https://curl.se/libcurl/c/CURLOPT_TCP_NODELAY.html
+	//   Ensure that TCP_NODELAY is set to 0 to ensure that TCP NAGLE is enabled
+	http.handle.set(CurlOption.tcp_nodelay,0);
+	
+	// Explicitly set to ensure libcurl keep the connection open for possible later reuse
+	//   https://curl.se/libcurl/c/CURLOPT_FORBID_REUSE.html
+	http.handle.set(CurlOption.forbid_reuse,0);
+	
+	// Set HTTP method to HEAD for minimal data transfer
+	http.method = HTTP.Method.head;
+	
+	// Exit scope to ensure cleanup http object
+	scope(exit) {
+		try {
+			if (!http.isStopped) {
+				// Shut http down http object
+				http.shutdown();
+			}
+		} finally {
+			// Destroy, however we cant set to null
+			object.destroy(http);
+		}
+	}
+	
+	// Capture both clocks immediately around the request. Realtime is required for
+	// comparison with Microsoft's wall-clock Date value; monotonic time is required
+	// for reliable RTT measurement even if the system clock is adjusted mid-request.
+	result.requestStartUtc = Clock.currTime(UTC());
+	auto requestStartMonotonic = MonoTime.currTime();
+
+	// Execute the request and handle exceptions
+	try {
+		if (displayLogging) {
+			addLogEntry("Attempting to contact the Microsoft OneDrive Service");
+		}
+		http.perform();
+
+		// Capture timing immediately after the transfer completes, before logging or
+		// response processing introduces unrelated delay into the measurement.
+		result.responseEndMonotonic = MonoTime.currTime();
+		result.responseEndUtc = Clock.currTime(UTC());
+		result.roundTripTime = result.responseEndMonotonic - requestStartMonotonic;
+		result.httpStatusCode = http.statusLine.code;
+
+		// Capture Date for the time subsystem. Missing Date is not a network failure;
+		// it will be classified separately as TIME_AUTHORITY_UNAVAILABLE.
+		auto responseHeaders = http.responseHeaders();
+		result.responseDateHeader = getHttpResponseHeaderCaseInsensitive(responseHeaders, "date");
+
+		// Check response for HTTP status code - consider 2xx and 3xx as "reachable"
+		if (http.statusLine.code >= 200 && http.statusLine.code < 400) {
+			if (displayLogging) {
+				addLogEntry("Successfully reached the Microsoft OneDrive Service");
+			}
+			result.reachable = true;
+			result.failureReason = "";
+		} else {
+			addLogEntry("Failed to reach the Microsoft OneDrive Service. HTTP status code: " ~ to!string(http.statusLine.code));
+			result.reachable = false;
+			result.failureReason = "http_status_" ~ to!string(http.statusLine.code);
+		}
+	} catch (SocketException e) {
+		result.responseEndMonotonic = MonoTime.currTime();
+		result.responseEndUtc = Clock.currTime(UTC());
+		result.roundTripTime = result.responseEndMonotonic - requestStartMonotonic;
+		addLogEntry("Cannot connect to the Microsoft OneDrive Service - Socket Issue: " ~ e.msg);
+		displayOneDriveErrorMessage(e.msg, getFunctionName!({}));
+		result.reachable = false;
+		result.failureReason = "socket_exception";
+	} catch (CurlException e) {
+		result.responseEndMonotonic = MonoTime.currTime();
+		result.responseEndUtc = Clock.currTime(UTC());
+		result.roundTripTime = result.responseEndMonotonic - requestStartMonotonic;
+		addLogEntry("Cannot connect to the Microsoft OneDrive Service - Network Connection Issue: " ~ e.msg);
+		displayOneDriveErrorMessage(e.msg, getFunctionName!({}));
+		result.reachable = false;
+		result.failureReason = "curl_exception";
+	} catch (Exception e) {
+		result.responseEndMonotonic = MonoTime.currTime();
+		result.responseEndUtc = Clock.currTime(UTC());
+		result.roundTripTime = result.responseEndMonotonic - requestStartMonotonic;
+		addLogEntry("An unexpected error occurred: " ~ e.toString());
+		displayOneDriveErrorMessage(e.toString(), getFunctionName!({}));
+		result.reachable = false;
+		result.failureReason = "unexpected_exception";
+	}
+	
+	return result;
+}
+
+// Backwards-compatible boolean reachability wrapper used by subsystems that do
+// not need the richer time observation.
+bool testInternetReachability(ApplicationConfig appConfig, bool displayLogging = true) {
+	return probeMicrosoftService(appConfig, displayLogging).reachable;
+}
+
+// Retry Internet access test to Microsoft OneDrive and retain the final probe so
+// startup can consume its Date/timing data without immediately issuing another
+// request after connectivity is restored.
+bool retryInternetConnectivityTest(ApplicationConfig appConfig, out MicrosoftServiceProbeResult lastProbe) {
+	int retryAttempts = 0;
+	int backoffInterval = 1; // initial backoff interval in seconds
+	int maxBackoffInterval = 3600; // maximum backoff interval in seconds
+	int maxRetryCount = 100; // max retry attempts, reduced for practicality
+	bool isOnline = false;
+
+	while (retryAttempts < maxRetryCount && !isOnline) {
+		if (backoffInterval < maxBackoffInterval) {
+			backoffInterval = min(backoffInterval * 2, maxBackoffInterval); // exponential increase
+		}
+
+		if (debugLogging) {
+			addLogEntry("  Retry Attempt:      " ~ to!string(retryAttempts + 1), ["debug"]);
+			addLogEntry("  Retry In (seconds): " ~ to!string(backoffInterval), ["debug"]);
+		}
+
+		Thread.sleep(dur!"seconds"(backoffInterval));
+		lastProbe = probeMicrosoftService(appConfig);
+		isOnline = lastProbe.reachable;
+
+		if (isOnline) {
+			addLogEntry("Internet connectivity to Microsoft OneDrive service has been restored");
+		}
+
+		retryAttempts++;
+	}
+
+	if (!isOnline) {
+		addLogEntry("ERROR: Was unable to reconnect to the Microsoft OneDrive service after " ~ to!string(maxRetryCount) ~ " attempts!");
+	}
+	
+	return isOnline;
+}
+
+// Preserve the original call signature for existing callers.
+bool retryInternetConnectivityTest(ApplicationConfig appConfig) {
+	MicrosoftServiceProbeResult ignoredProbe;
+	return retryInternetConnectivityTest(appConfig, ignoredProbe);
+}
+
+// Can we read the local file - as a permissions issue or file corruption will cause a failure
 // https://github.com/abraunegg/onedrive/issues/113
 // returns true if file can be accessed
-bool readLocalFile(string path)
-{
-	try {
-		// attempt to read up to the first 1 byte of the file
-		// validates we can 'read' the file based on file permissions
-		read(path,1);
-	} catch (std.file.FileException e) {
-		// unable to read the new local file
-		displayFileSystemErrorMessage(e.msg, getFunctionName!({}));
-		return false;
+bool readLocalFile(string path) {
+	// Set this function name
+	string thisFunctionName = format("%s.%s", strip(__MODULE__) , strip(getFunctionName!({})));
+
+	// What is the file size
+	if (getSize(path) != 0) {
+		try {
+			// Attempt to read up to the first 1 byte of the file
+			auto data = read(path, 1);
+
+			// Check if the read operation was successful
+			if (data.length != 1) {
+				// Read operation not successful
+				addLogEntry("Failed to read the required amount from the file: " ~ path);
+				return false;
+			}
+		} catch (std.file.FileException e) {
+			// Unable to read the file, log the error message
+			displayFileSystemErrorMessage(e.msg, thisFunctionName, path);
+			return false;
+		}
+		return true;
+	} else {
+		// zero byte files cannot be read, return true
+		return true;
 	}
-	return true;
 }
 
-// calls globMatch for each string in pattern separated by '|'
-bool multiGlobMatch(const(char)[] path, const(char)[] pattern)
-{
+// Calls globMatch for each string in pattern separated by '|'
+bool multiGlobMatch(const(char)[] path, const(char)[] pattern) {
+	if (path.length == 0 || pattern.length == 0) {
+		return false;
+	}
+
+	if (!pattern.canFind('|')) {
+		return globMatch!(std.path.CaseSensitive.yes)(path, pattern);
+	}
+
 	foreach (glob; pattern.split('|')) {
 		if (globMatch!(std.path.CaseSensitive.yes)(path, glob)) {
 			return true;
@@ -187,49 +987,99 @@ bool multiGlobMatch(const(char)[] path, const(char)[] pattern)
 	return false;
 }
 
-bool isValidName(string path)
-{
-	// Restriction and limitations about windows naming files
+// Check if the provided item name is a reserved Microsoft / Windows device name
+// This must catch both:
+//   - exact reserved names, e.g. "CON"
+//   - reserved names followed by an extension, e.g. "CON.txt", "NUL.tar.gz"
+// Microsoft documents that reserved names remain invalid even when followed by an extension.
+bool isReservedMicrosoftName(string itemName, const(bool[string]) disallowedSet) {
+	// Ensure case-insensitive comparisons
+	string candidate = itemName.toLower();
+
+	// Exact match
+	if (disallowedSet.get(candidate, false)) {
+		return true;
+	}
+
+	// Reserved device names followed by an extension, e.g. "CON.txt"
+	auto firstDot = countUntil(candidate, ".");
+	if (firstDot > 0) {
+		string deviceRoot = candidate[0 .. firstDot];
+		if (disallowedSet.get(deviceRoot, false)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Does the path pass the Microsoft restriction and limitations about naming files and folders
+bool isValidName(string path) {
+	// Restriction and limitations about windows naming files and folders
 	// https://msdn.microsoft.com/en-us/library/aa365247
 	// https://support.microsoft.com/en-us/help/3125202/restrictions-and-limitations-when-you-sync-files-and-folders
 	
-	// allow root item
 	if (path == ".") {
 		return true;
 	}
 
-	bool matched = true;
-	string itemName = baseName(path);
+	string itemName = baseName(path).toLower(); // Ensure case-insensitivity
 
-	auto invalidNameReg =
-		ctRegex!(
-			// Leading whitespace and trailing whitespace/dot
-			`^\s.*|^.*[\s\.]$|` ~
-			// Invalid characters
-			`.*[<>:"\|\?*/\\].*|` ~
-			// Reserved device name and trailing .~
-			`(?:^CON|^PRN|^AUX|^NUL|^COM[0-9]|^LPT[0-9])(?:[.].+)?$`
-		);
-	auto m = match(itemName, invalidNameReg);
-	matched = m.empty;
+	// Check for explicitly disallowed names
+	// https://support.microsoft.com/en-us/office/restrictions-and-limitations-in-onedrive-and-sharepoint-64883a5d-228e-48f5-b3d2-eb39e07630fa?ui=en-us&rs=en-us&ad=us#invalidfilefoldernames
+	string[] disallowedNames = [
+		".lock", "desktop.ini", "CON", "PRN", "AUX", "NUL",
+		"COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+	];
+
+	// Creating an associative array for faster lookup
+	bool[string] disallowedSet;
+	foreach (name; disallowedNames) {
+		disallowedSet[name.toLower()] = true; // Normalise to lowercase
+	}
+
+	if (isReservedMicrosoftName(itemName, disallowedSet) || itemName.startsWith("~$") || canFind(itemName, "_vti_")) {
+		return false;
+	}
+
+	// Regular expression for invalid patterns
+	// https://support.microsoft.com/en-us/office/restrictions-and-limitations-in-onedrive-and-sharepoint-64883a5d-228e-48f5-b3d2-eb39e07630fa?ui=en-us&rs=en-us&ad=us#invalidcharacters
+	// Leading whitespace and trailing whitespace
+	// Invalid characters
+	// Trailing dot '.' (not documented above) , however see issue https://github.com/abraunegg/onedrive/issues/2678
 	
-	// Additional explicit validation checks
-	if (itemName == ".lock") {matched = false;}
-	if (itemName == "desktop.ini") {matched = false;}
-	// _vti_ cannot appear anywhere in a file or folder name
-	if(canFind(itemName, "_vti_")){matched = false;}
-	// Item name cannot equal '~'
-	if (itemName == "~") {matched = false;}
-	
-	// return response
-	return matched;
+	//auto invalidNameReg = ctRegex!(`^\s.*|^.*[\s\.]$|.*[<>:"\|\?*/\\].*`); - original to remove at some point
+	auto invalidNameReg = ctRegex!(`^\s+|\s$|\.$|[<>:"\|\?*/\\]`); // revised 25/3/2024
+	// - ^\s+ matches one or more whitespace characters at the start of the string. The + ensures we match one or more whitespaces, making it more efficient than .* for detecting leading whitespaces.
+	// - \s$ matches a whitespace character at the end of the string. This is more precise than [\s\.]$ because we'll handle the dot separately.
+	// -  \.$ specifically matches a dot character at the end of the string, addressing the requirement to catch trailing dots as invalid.
+	// - [<>:"\|\?*/\\] matches any single instance of the specified invalid characters: ", *, :, <, >, ?, /, \, |
+
+	auto matchResult = match(itemName, invalidNameReg);
+	if (!matchResult.empty) {
+		return false;
+	}
+
+	// Determine if the path is at the root level, if yes, check that 'forms' is not the first folder
+	auto segments = pathSplitter(path).array;
+	if (segments.length <= 2 && segments.back.toLower() == "forms") { // Check only the last segment, convert to lower as OneDrive is not POSIX compliant, easier to compare
+		return false;
+	}
+
+	return true;
 }
 
-bool containsBadWhiteSpace(string path)
-{
-	// allow root item
+// Does the path contain any bad whitespace characters
+bool containsBadWhiteSpace(string path) {
+	// Check for null or empty string
+	if (path.length == 0) {
+		return false;
+	}
+
+	// Check for root item
 	if (path == ".") {
-		return true;
+		return false;
 	}
 	
 	// https://github.com/abraunegg/onedrive/issues/35
@@ -239,51 +1089,338 @@ bool containsBadWhiteSpace(string path)
 	//		/v1.0/me/drive/root:/.%2FState-of-the-art%2C%20challenges%2C%20and%20open%20issues%20in%20the%20integration%20of%20Internet%20of%0AThings%20and%20Cloud%20Computing.pdf
 	// The '$'\n'' is translated to %0A which causes the OneDrive query to fail
 	// Check for the presence of '%0A' via regex
-	
+
 	string itemName = encodeComponent(baseName(path));
-	auto invalidWhitespaceReg =
-		ctRegex!(
-			// Check for \n which is %0A when encoded
-			`%0A`
-		);
-	auto m = match(itemName, invalidWhitespaceReg);
-	return m.empty;
+	// Check for encoded newline character
+	return itemName.indexOf("%0A") != -1;
 }
 
-bool containsASCIIHTMLCodes(string path)
-{
+// Does the path contain any ASCII HTML Codes
+bool containsASCIIHTMLCodes(string path) {
+	// Check for null or empty string
+	if (path.length == 0) {
+		return false;
+	}
+
+	// Check for root item
+	if (path == ".") {
+		return false;
+	}
+
 	// https://github.com/abraunegg/onedrive/issues/151
-	// If a filename contains ASCII HTML codes, regardless of if it gets encoded, it generates an error
+	// If a filename contains ASCII HTML codes, it generates an error when attempting to upload this to Microsoft OneDrive
 	// Check if the filename contains an ASCII HTML code sequence
 
-	auto invalidASCIICode = 
-		ctRegex!(
-			// Check to see if &#XXXX is in the filename
-			`(?:&#|&#[0-9][0-9]|&#[0-9][0-9][0-9]|&#[0-9][0-9][0-9][0-9])`
-		);
-	
-	auto m = match(path, invalidASCIICode);
-	return m.empty;
+	// Check for the pattern &# followed by 1 to 4 digits and a semicolon
+	auto invalidASCIICode = ctRegex!(`&#[0-9]{1,4};`);
+
+	// Use match to search for ASCII HTML codes in the path
+	auto matchResult = match(path, invalidASCIICode);
+
+	// Return true if ASCII HTML codes are found
+	return !matchResult.empty;
+}
+
+// Does the path contain any ASCII Control Codes
+bool containsASCIIControlCodes(string path) {
+	// Check for null or empty string
+	if (path.length == 0) {
+		return false;
+	}
+
+	// Check for root item
+	if (path == ".") {
+		return false;
+	}
+
+	// https://github.com/abraunegg/onedrive/discussions/2553#discussioncomment-7995254
+	//  Define a ctRegex pattern for ASCII control codes and specific non-ASCII control characters
+	//  This pattern includes the ASCII control range and common non-ASCII control characters
+	//  Adjust the pattern as needed to include specific characters of concern
+	auto controlCodePattern = ctRegex!(`[\x00-\x1F\x7F]|\p{Cc}`); // Blocks ƒ†¯~‰ (#2553) , allows α (#2598)
+
+	// Use match to search for ASCII control codes in the path
+	auto matchResult = match(path, controlCodePattern);
+
+	// Return true if matchResult is not empty (indicating a control code was found)
+	return !matchResult.empty;
+}
+
+// Is the string a valid UTF-8 timestamp string?
+bool isValidUTF8Timestamp(string input) {
+	try {
+		// Validate the entire string for UTF-8 correctness
+		validate(input); // Throws UTFException if invalid UTF-8 is found
+
+		// Validate the input against UTF-8 test cases
+		if (!isValidUTF8(input)) {
+			// error message already printed
+			return false;
+		}
+		
+		// Additional edge-case handling because the input format is known and controlled:
+		// Ensure input length is within the expected range for a UTC datetime
+		if (input.length < 20 || input.length > 30) {
+			// not the correct length
+			addLogEntry("UTF-8 validation failed: Input '" ~ input ~ "' is not within the expected length range for UTC datetime strings (20-30 characters).");
+			return false;
+		}
+
+		return true;
+	} catch (UTFException) {
+		addLogEntry("UTF-8 validation failed: Input '" ~ input ~ "' contains invalid UTF-8 characters.");
+		return false;
+	}
+}
+
+// Is the string a valid UTF-8 string?
+bool isValidUTF8(string input) {
+	try {
+		// Validate the entire string for UTF-8 correctness
+		validate(input); // Throws UTFException if invalid UTF-8 is found
+
+		// Iterate through each character using byUTF to ensure proper UTF-8 decoding
+		auto it = input.byUTF!(char);
+		foreach (_; it) {
+			// Iterating over the range ensures every UTF-8 sequence in the string is decoded into valid `dchar`s.
+			// Throws a UTFException if an invalid UTF-8 sequence is encountered during decoding.
+		}
+
+		// Check for replacement characters
+		if (input.count!((dchar c) => c == '\uFFFD') > 0) {
+			// contains replacement character
+			addLogEntry("UTF-8 validation failed: Input contains replacement characters (�).");
+			return false;
+		}
+
+		// return true
+		return true;
+	} catch (UTFException) {
+		addLogEntry("UTF-8 validation failed: Input '" ~ input ~ "' contains invalid UTF-8 characters.");
+		return false;
+	}
+}
+
+// Is the path a valid UTF-16 encoded path?
+bool isValidUTF16(string path) {
+	// Check for null or empty string
+	if (path.length == 0) {
+		return true;
+	}
+
+	// Check for root item
+	if (path == ".") {
+		return true;
+	}
+
+	auto wpath = toUTF16(path); // Convert to UTF-16 encoding
+	auto it = wpath.byCodeUnit;
+
+	while (!it.empty) {
+		ushort current = it.front;
+		
+		// Check for valid single unit
+		if (current <= 0xD7FF || (current >= 0xE000 && current <= 0xFFFF)) {
+			it.popFront();
+		}
+		// Check for valid surrogate pair
+		else if (current >= 0xD800 && current <= 0xDBFF) {
+			it.popFront();
+			if (it.empty || it.front < 0xDC00 || it.front > 0xDFFF) {
+				return false; // Invalid surrogate pair
+			}
+			it.popFront();
+		} else {
+			return false; // Invalid code unit
+		}
+	}
+
+	return true;
+}
+
+// Parse a Microsoft Graph UTC timestamp into SysTime without using SysTime.fromISOExtString()
+// as the validator. This avoids parsing the same timestamp twice and gives callers a parsed
+// value they can reuse.
+bool parseUTCDateTime(string dateTimeString, out SysTime parsedTime) {
+	// Validate for UTF-8 first
+	if (!isValidUTF8Timestamp(dateTimeString)) {
+		if (dateTimeString.empty) {
+			addLogEntry("BAD TIMESTAMP (UTF-8 FAIL): empty string");
+		} else {
+			addLogEntry("BAD TIMESTAMP (UTF-8 FAIL): " ~ dateTimeString);
+		}
+		return false;
+	}
+
+	// Check timestamp against what is a valid format shape
+	if (!isGraphUtcTimestampShape(dateTimeString)) {
+		addLogEntry("BAD TIMESTAMP (FORMAT FAIL): " ~ dateTimeString);
+		return false;
+	}
+
+	int parseFixedWidthDigits(const(char)[] s, size_t offset, size_t count) {
+		int value = 0;
+
+		foreach (i; 0 .. count) {
+			immutable c = s[offset + i];
+			if ((c < '0') || (c > '9')) {
+				return -1;
+			}
+			value = (value * 10) + cast(int)(c - '0');
+		}
+
+		return value;
+	}
+
+	int year = parseFixedWidthDigits(dateTimeString, 0, 4);
+	int month = parseFixedWidthDigits(dateTimeString, 5, 2);
+	int day = parseFixedWidthDigits(dateTimeString, 8, 2);
+	int hour = parseFixedWidthDigits(dateTimeString, 11, 2);
+	int minute = parseFixedWidthDigits(dateTimeString, 14, 2);
+	int second = parseFixedWidthDigits(dateTimeString, 17, 2);
+
+	if ((year < 0) || (month < 0) || (day < 0) || (hour < 0) || (minute < 0) || (second < 0)) {
+		addLogEntry("BAD TIMESTAMP (DIGIT PARSE FAIL): " ~ dateTimeString);
+		return false;
+	}
+
+	long fractionalHnsecs = 0;
+
+	// Fraction starts after "YYYY-MM-DDTHH:MM:SS."
+	if ((dateTimeString.length > 20) && (dateTimeString[19] == '.')) {
+		size_t digitsUsed = 0;
+		size_t fractionEnd = dateTimeString.length - 1; // trailing Z
+
+		foreach (i; 20 .. fractionEnd) {
+			immutable c = dateTimeString[i];
+
+			if ((c < '0') || (c > '9')) {
+				addLogEntry("BAD TIMESTAMP (FRACTION PARSE FAIL): " ~ dateTimeString);
+				return false;
+			}
+
+			// SysTime stores fractional seconds in hnsecs / 100ns units.
+			// Preserve the first 7 fractional digits and ignore smaller precision.
+			if (digitsUsed < 7) {
+				fractionalHnsecs = (fractionalHnsecs * 10) + cast(long)(c - '0');
+				digitsUsed++;
+			}
+		}
+
+		while (digitsUsed < 7) {
+			fractionalHnsecs *= 10;
+			digitsUsed++;
+		}
+	}
+
+	try {
+		parsedTime = SysTime(DateTime(year, month, day, hour, minute, second), UTC());
+
+		if (fractionalHnsecs > 0) {
+			parsedTime.fracSecs = dur!"hnsecs"(fractionalHnsecs);
+		}
+
+		return true;
+	} catch (Exception e) {
+		addLogEntry("BAD TIMESTAMP (CONVERSION FAIL): " ~ dateTimeString);
+		return false;
+	}
+}
+
+// Validate that the provided string is a valid date time stamp in UTC format
+bool isValidUTCDateTime(string dateTimeString) {
+		SysTime parsedTime;
+		return parseUTCDateTime(dateTimeString, parsedTime);
+}
+
+// Does the timestamp, as provided by the Microsoft GraphAPI, conform to the correct shape?
+// - This is a better way to determine this than using a regex function
+bool isGraphUtcTimestampShape(const(char)[] s) {
+	bool allDigits(size_t start, size_t end) {
+		if (end > s.length) return false;
+
+		foreach (c; s[start .. end]) {
+			if (c < '0' || c > '9') {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	// Minimum: 2026-07-01T05:13:03Z = 20 chars
+	// Maximum currently allowed by existing code: 30 chars
+	if (s.length < 20 || s.length > 30) {
+		return false;
+	}
+
+	if (!allDigits(0, 4)) return false;
+	if (s[4] != '-') return false;
+	if (!allDigits(5, 7)) return false;
+	if (s[7] != '-') return false;
+	if (!allDigits(8, 10)) return false;
+	if (s[10] != 'T') return false;
+	if (!allDigits(11, 13)) return false;
+	if (s[13] != ':') return false;
+	if (!allDigits(14, 16)) return false;
+	if (s[16] != ':') return false;
+	if (!allDigits(17, 19)) return false;
+	if (s[$ - 1] != 'Z') return false;
+
+	// No fractional seconds
+	if (s.length == 20) {
+		return true;
+	}
+
+	// Fractional seconds: .123Z, .1234567Z, etc.
+	if (s[19] != '.') {
+		return false;
+	}
+
+	// Require at least one fractional digit before Z
+	if (s.length <= 21) {
+		return false;
+	}
+
+	return allDigits(20, s.length - 1);
+}
+
+
+
+// Does the path contain any HTML URL encoded items (e.g., '%20' for space)
+bool containsURLEncodedItems(string path) {
+	// Check for null or empty string
+	if (path.length == 0) {
+		return false;
+	}
+
+	// Pattern for percent encoding: % followed by two hexadecimal digits
+	auto urlEncodedPattern = ctRegex!(`%[0-9a-fA-F]{2}`);
+
+	// Search for URL encoded items in the string
+	auto matchResult = match(path, urlEncodedPattern);
+
+	// Return true if URL encoded items are found
+	return !matchResult.empty;
 }
 
 // Parse and display error message received from OneDrive
-void displayOneDriveErrorMessage(string message, string callingFunction)
-{
-	log.error("\nERROR: Microsoft OneDrive API returned an error with the following message:");
+void displayOneDriveErrorMessage(string message, string callingFunction) {
+	addLogEntry();
+	addLogEntry("ERROR: Microsoft OneDrive API returned an error with the following message:");
 	auto errorArray = splitLines(message);
-	log.error("  Error Message:    ", errorArray[0]);
+	addLogEntry("  Error Message:       " ~ to!string(errorArray[0]));
 	// Extract 'message' as the reason
 	JSONValue errorMessage = parseJSON(replace(message, errorArray[0], ""));
-	// extra debug
-	log.vdebug("Raw Error Data: ", message);
-	log.vdebug("JSON Message: ", errorMessage);
 	
 	// What is the reason for the error
 	if (errorMessage.type() == JSONType.object) {
 		// configure the error reason
 		string errorReason;
+		string errorCode;
 		string requestDate;
 		string requestId;
+		string localizedMessage;
 		
 		// set the reason for the error
 		try {
@@ -301,14 +1438,31 @@ void displayOneDriveErrorMessage(string message, string callingFunction)
 			// we dont want to do anything here
 		}
 		
+		// Microsoft has started adding 'localizedMessage' to error JSON responses. If this is available, use this
+		try {
+			// Use ["error"]["localizedMessage"] as localised reason
+			localizedMessage = errorMessage["error"]["localizedMessage"].str;	
+		} catch (JSONException e) {
+			// we dont want to do anything here if not available
+		}
+		
 		// Display the error reason
 		if (errorReason.startsWith("<!DOCTYPE")) {
 			// a HTML Error Reason was given
-			log.error("  Error Reason:  A HTML Error response was provided. Use debug logging (--verbose --verbose) to view this error");
-			log.vdebug(errorReason);
+			addLogEntry("  Error Reason:        A HTML Error response was provided. Use debug logging (--verbose --verbose) to view this error");
+			if (debugLogging) {addLogEntry(errorReason, ["debug"]);}
+			
 		} else {
 			// a non HTML Error Reason was given
-			log.error("  Error Reason:     ", errorReason);
+			addLogEntry("  Error Reason:        " ~ errorReason);
+		}
+		
+		// Get the error code if available
+		try {
+			// Use ["error"]["code"] as code
+			errorCode = errorMessage["error"]["code"].str;
+		} catch (JSONException e) {
+			// we dont want to do anything here
 		}
 		
 		// Get the date of request if available
@@ -327,150 +1481,1740 @@ void displayOneDriveErrorMessage(string message, string callingFunction)
 			// we dont want to do anything here
 		}
 		
-		// Display the date and request id if available
-		if (requestDate != "") log.error("  Error Timestamp:  ", requestDate);
-		if (requestId != "")   log.error("  API Request ID:   ", requestId);
+		// Display the localizedMessage, error code, date and request id if available
+		if (localizedMessage != "")   addLogEntry("  Error Reason (L10N): " ~ localizedMessage);
+		if (errorCode != "")   addLogEntry("  Error Code:          " ~ errorCode);
+		if (requestDate != "") addLogEntry("  Error Timestamp:     " ~ requestDate);
+		if (requestId != "")   addLogEntry("  API Request ID:      " ~ requestId);		   
 	}
 	
 	// Where in the code was this error generated
-	log.vlog("  Calling Function: ", callingFunction);
+	if (verboseLogging) {addLogEntry("  Calling Function:    " ~ callingFunction, ["verbose"]);} // will get printed in debug
+	
+	// Extra Debug if we are using --verbose --verbose
+	if (debugLogging) {
+		addLogEntry("Raw Error Data: " ~ message, ["debug"]);
+		addLogEntry("JSON Message: " ~ to!string(errorMessage), ["debug"]);
+	}
+	
+	// The parsed error object is no longer required once all display fields have been extracted.
+	errorMessage = null;
+
+	// Close out logging with an empty line, so that in console output, and logging output this becomes clear
+	addLogEntry();
+}
+
+// Common code for handling when a client is unauthorised
+void handleClientUnauthorised(int httpStatusCode, JSONValue errorMessage) {
+	// What httpStatusCode was received
+	if (httpStatusCode == 400) {
+		// bad request or a new auth token is needed
+		// configure the error reason
+		// Is there an error description?
+		if ("error_description" in errorMessage) {
+			// error_description to process
+			addLogEntry();
+			string[] errorReason = splitLines(errorMessage["error_description"].str);
+			addLogEntry(to!string(errorReason[0]), ["info", "notify"]);
+			addLogEntry();
+			addLogEntry("ERROR: You will need to issue a --reauth and re-authorise this client to obtain a fresh auth token.", ["info", "notify"]);
+			addLogEntry();
+		} else {
+			if ("code" in errorMessage["error"]) {
+				if (errorMessage["error"]["code"].str == "invalidRequest") {
+					addLogEntry();
+					addLogEntry("ERROR: Check your configuration as your existing refresh_token generated an invalid request. You may need to issue a --reauth and re-authorise this client.", ["info", "notify"]);
+					addLogEntry();
+				}
+			} else {
+				// no error_description
+				addLogEntry();
+				addLogEntry("ERROR: Check your configuration as it may be invalid. You will need to issue a --reauth and re-authorise this client to obtain a fresh auth token.", ["info", "notify"]);
+				addLogEntry();
+			}
+		}
+	} else {
+		// 401 error code
+		addLogEntry();
+		addLogEntry("ERROR: Check your configuration as your refresh_token may be empty or invalid. You may need to issue a --reauth and re-authorise this client.", ["info", "notify"]);
+		addLogEntry();
+	}
 }
 
 // Parse and display error message received from the local file system
-void displayFileSystemErrorMessage(string message, string callingFunction) 
-{
-	log.error("\nERROR: The local file system returned an error with the following message:");
-	auto errorArray = splitLines(message);
-	// What was the error message
-	log.error("  Error Message:    ", errorArray[0]);
-	// Where in the code was this error generated
-	log.vlog("  Calling Function: ", callingFunction);
-	// If we are out of disk space (despite download reservations) we need to exit the application
-	ulong localActualFreeSpace = to!ulong(getAvailableDiskSpace("."));
-	if (localActualFreeSpace == 0) {
-		// force exit
-		exit(-1);
+void displayFileSystemErrorMessage(string message, string callingFunction, string contextPath, FsErrorSeverity severity = FsErrorSeverity.error) {
+	// Separate this block from surrounding log output
+	addLogEntry();
+
+	// Header prefix for logging accuracy
+	string headerPrefix = severity == FsErrorSeverity.warning ? "WARNING"
+					  : severity == FsErrorSeverity.permission ? "WARNING"
+					  : severity == FsErrorSeverity.fatal ? "FATAL"
+					  : "ERROR";
+	
+	// Filesystem logging header
+	addLogEntry(headerPrefix ~ ": The local file system returned an error with the following details:");
+		
+	// Calling context (helps correlate where this came from)
+	if (!callingFunction.empty) {
+		addLogEntry("  Calling Function:  " ~ callingFunction);
 	}
+
+	// Path context (the *thing* we were operating on)
+	if (!contextPath.empty) {
+		addLogEntry("  Path:              " ~ contextPath);
+	} else {
+		addLogEntry("  Path:              (not available)");
+	}
+
+	// Primary error message (first line) + any additional lines
+	string errorMessage = message;
+	string[] errorLines;
+	try {
+		errorLines = splitLines(message);
+	} catch (Exception e) {
+		// splitLines should not fail, but never let logging throw
+		addLogEntry("  NOTE: Failed to split file system exception message into lines: " ~ e.msg);
+	}
+
+	// If we have lines to process
+	if (errorLines.length > 0) {
+		// First line: usually the most useful
+		errorMessage = to!string(errorLines[0]);
+		addLogEntry("  Error Message:     " ~ errorMessage);
+
+		// Remaining lines (if any) often contain errno / path / syscall details
+		if (errorLines.length > 1) {
+			addLogEntry("  Error Details:");
+			foreach (i, line; errorLines[1 .. $]) {
+				// Avoid logging empty lines, but keep order
+				if (!line.empty) {
+					addLogEntry("     - " ~ to!string(line));
+				}
+			}
+		}
+	} else {
+		addLogEntry("  Error Message:     No error message available");
+	}
+
+	// Disk space diagnostics (best-effort) - if this is not a permission issue
+	if (severity != FsErrorSeverity.permission) {
+		// We intentionally probe both the current directory and the target path directory when possible.
+		try {
+			// Always check the current working directory as a baseline
+			ulong freeCwd = to!ulong(getAvailableDiskSpace("."));
+			addLogEntry("  Disk Space (CWD):  " ~ to!string(freeCwd) ~ " bytes available");
+
+			// If we have a context path, also check its parent directory when possible.
+			// We keep this conservative: if anything throws, just log the exception.
+			if (!contextPath.empty) {
+				string targetProbePath = contextPath;
+
+				// If it's a file path, probe the parent directory (where writes/renames happen).
+				// Avoid throwing if parentDir isn't available or contextPath is weird.
+				try {
+					// std.path.dirName handles both file/dir paths; if it returns ".", keep as-is.
+					import std.path : dirName;
+					auto parent = dirName(contextPath);
+					if (!parent.empty) targetProbePath = parent;
+				} catch (Exception e) {
+					addLogEntry("  NOTE: Failed to derive parent directory from path: " ~ e.msg);
+				}
+
+				ulong freeTarget = to!ulong(getAvailableDiskSpace(targetProbePath));
+				addLogEntry("  Disk Space (Path): " ~ to!string(freeTarget) ~ " bytes available (parent path: " ~ targetProbePath ~ ")");
+
+				// Preserve existing behaviour: if disk space check returns 0, force exit.
+				// (Assumes getAvailableDiskSpace returns 0 on a hard failure in your implementation.)
+				if (freeTarget == 0 || freeCwd == 0) {
+					// Must force exit here, allow logging to be done
+					forceExit();
+				}
+			} else {
+				// Preserve existing behaviour: if disk space check returns 0, force exit.
+				if (freeCwd == 0) {
+					forceExit();
+				}
+			}
+		} catch (Exception e) {
+			// Handle exceptions from disk space check or type conversion
+			addLogEntry("  NOTE: Exception during disk space check: " ~ e.msg);
+		}
+	}
+	
+	// Add note for WARNING messages
+	if (severity == FsErrorSeverity.warning) {
+		addLogEntry();
+		addLogEntry("NOTE: This warning is non-fatal; the client will continue to operate, but this may affect future operations if not resolved");
+		addLogEntry();
+	}
+	
+	// Add note for filesystem permission messages
+	if (severity == FsErrorSeverity.permission) {
+		addLogEntry();
+		addLogEntry("NOTE: Sync will continue. This file’s timestamps could not be updated because the effective user does not own the file.");
+		addLogEntry("      Potential Fix:");
+		addLogEntry("           Run the client as the file owner, or change ownership of the sync tree so it is owned by the user running the client.");
+		addLogEntry("      Learn more about File Ownership:");
+		addLogEntry("           https://www.redhat.com/en/blog/linux-file-permissions-explained");
+		addLogEntry("           https://unix.stackexchange.com/questions/191940/difference-between-owner-root-and-ruid-euid");
+		addLogEntry();
+	}
+	
+	// Add note for ERROR messages
+	if (severity == FsErrorSeverity.error) {
+		addLogEntry();
+		addLogEntry("NOTE: This error requires attention; the client may continue running, but functionality is impaired and the issue should be resolved.");
+		addLogEntry();
+	}
+	
+	// Add note for FATAL messages
+	if (severity == FsErrorSeverity.fatal) {
+		addLogEntry();
+		addLogEntry("NOTE: This error is fatal; the client cannot continue and this issue must be corrected before retrying. The client will now attempt to exit in a safe and orderly manner.");
+		addLogEntry();
+	}
+}
+
+// Display the POSIX Error Message
+void displayPosixErrorMessage(string message) {
+	addLogEntry(); // used rather than writeln
+	addLogEntry("ERROR: Microsoft OneDrive API returned data that highlights a POSIX compliance issue:");
+	addLogEntry("  Error Message:    " ~ message);
+}
+
+// Display the Error Message
+void displayGeneralErrorMessage(Exception e, string callingFunction=__FUNCTION__, int lineno=__LINE__) {
+	addLogEntry(); // used rather than writeln
+	addLogEntry("ERROR: Encountered a " ~ e.classinfo.name ~ ":");
+	addLogEntry("  Error Message:    " ~ e.msg);
+	addLogEntry("  Calling Function: " ~ callingFunction);
+	addLogEntry("  Line number:      " ~ to!string(lineno));
 }
 
 // Get the function name that is being called to assist with identifying where an error is being generated
 string getFunctionName(alias func)() {
-    return __traits(identifier, __traits(parent, func)) ~ "()\n";
+	return __traits(identifier, __traits(parent, func)) ~ "()\n";
+}
+
+JSONValue fetchOnlineURLContent(string url) {
+	// Function variables
+	char[] content;
+	JSONValue onlineContent;
+
+	// Setup HTTP request
+	HTTP http = HTTP();
+	
+	// Exit scope to ensure cleanup
+	scope(exit) {
+		// Shut http down and destroy
+		http.shutdown();
+		object.destroy(http);
+	}
+	
+	// Configure the URL to access
+	http.url = url;
+	// HTTP the connection method
+	http.method = HTTP.Method.get;
+	// Data receive handler
+	http.onReceive = (ubyte[] data) {
+		content ~= data; // Append data as it's received
+		return data.length;
+	};
+	
+	// Perform HTTP request
+	http.perform();
+	// Parse Content
+	onlineContent = parseJSON(to!string(content));
+	// Return onlineResponse
+	return onlineContent;
 }
 
 // Get the latest release version from GitHub
-string getLatestReleaseVersion() {
-	// Import curl just for this function
-	import std.net.curl;
-	char[] content;
-	JSONValue json;
+JSONValue getLatestReleaseDetails() {
+	JSONValue githubLatest;
+	JSONValue versionDetails;
 	string latestTag;
+	string publishedDate;
 	
-	try {
-		content = get("https://api.github.com/repos/abraunegg/onedrive/releases/latest");
+	// Query GitHub for the 'latest' release details
+	try {	
+		githubLatest = fetchOnlineURLContent("https://api.github.com/repos/abraunegg/onedrive/releases/latest");
 	} catch (CurlException e) {
-		// curl generated an error - meaning we could not query GitHub
-		log.vdebug("Unable to query GitHub for latest release");
-	}
-	
-	try {
-		json = content.parseJSON();
+		if (debugLogging) {addLogEntry("CurlException: Unable to query GitHub for latest release - " ~ e.msg, ["debug"]);}
 	} catch (JSONException e) {
-		// unable to parse the content JSON, set to blank JSON
-		log.vdebug("Unable to parse GitHub JSON response");
-		json = parseJSON("{}");
+		if (debugLogging) {addLogEntry("JSONException: Unable to parse GitHub JSON response - " ~ e.msg, ["debug"]);}
 	}
 	
-	// json has to be a valid JSON object
-	if (json.type() == JSONType.object){
-		if ("tag_name" in json) {
+	// githubLatest has to be a valid JSON object
+	if (githubLatest.type() == JSONType.object){
+		// use the returned tag_name
+		if ("tag_name" in githubLatest) {
 			// use the provided tag
 			// "tag_name": "vA.B.CC" and strip 'v'
-			latestTag = strip(json["tag_name"].str, "v");
+			latestTag = strip(githubLatest["tag_name"].str, "v");
 		} else {
 			// set to latestTag zeros
-			log.vdebug("'tag_name' unavailable in JSON response. Setting latest GitHub release version to 0.0.0");
+			if (debugLogging) {addLogEntry("'tag_name' unavailable in JSON response. Setting GitHub 'tag_name' release version to 0.0.0", ["debug"]);}
 			latestTag = "0.0.0";
+		}
+		// use the returned published_at date
+		if ("published_at" in githubLatest) {
+			// use the provided value
+			publishedDate = githubLatest["published_at"].str;
+		} else {
+			// set to v2.0.0 release date
+			if (debugLogging) {addLogEntry("'published_at' unavailable in JSON response. Setting GitHub 'published_at' date to 2018-07-18T18:00:00Z", ["debug"]);}
+			publishedDate = "2018-07-18T18:00:00Z";
 		}
 	} else {
 		// JSONValue is not an object
-		log.vdebug("Invalid JSON Object. Setting latest GitHub release version to 0.0.0");
+		if (debugLogging) {addLogEntry("Invalid JSON Object response from GitHub. Setting GitHub 'tag_name' release version to 0.0.0", ["debug"]);}
 		latestTag = "0.0.0";
+		if (debugLogging) {addLogEntry("Invalid JSON Object. Setting GitHub 'published_at' date to 2018-07-18T18:00:00Z", ["debug"]);}
+		publishedDate = "2018-07-18T18:00:00Z";
 	}
 		
-	// return the latest github version
-	return latestTag;
+	// return the latest github version and published date as our own JSON
+	versionDetails = [
+		"latestTag": JSONValue(latestTag),
+		"publishedDate": JSONValue(publishedDate)
+	];
+	// versionDetails owns the extracted scalar values; release the GitHub response tree.
+	githubLatest = null;
+	
+	// return JSON
+	return versionDetails;
+}
+
+// Get the release details from the 'current' running version
+JSONValue getCurrentVersionDetails(string thisVersion) {
+	JSONValue githubDetails;
+	JSONValue versionDetails;
+	string versionTag = "v" ~ thisVersion;
+	string publishedDate;
+	
+	// Query GitHub for the release details to match the running version
+	try {
+		githubDetails = fetchOnlineURLContent("https://api.github.com/repos/abraunegg/onedrive/releases");
+	} catch (CurlException e) {
+		if (debugLogging) {addLogEntry("CurlException: Unable to query GitHub for release details - " ~ e.msg, ["debug"]);}
+		return parseJSON(`{"Error": "CurlException", "message": "` ~ e.msg ~ `"}`);
+	} catch (JSONException e) {
+		if (debugLogging) {addLogEntry("JSONException: Unable to parse GitHub JSON response - " ~ e.msg, ["debug"]);}
+		return parseJSON(`{"Error": "JSONException", "message": "` ~ e.msg ~ `"}`);
+	}
+	
+	// githubDetails has to be a valid JSON array
+	if (githubDetails.type() == JSONType.array){
+		foreach (searchResult; githubDetails.array) {
+			// searchResult["tag_name"].str;
+			if (searchResult["tag_name"].str == versionTag) {
+				if (debugLogging) {
+					addLogEntry("MATCHED version", ["debug"]);
+					addLogEntry("tag_name: " ~ searchResult["tag_name"].str, ["debug"]);
+					addLogEntry("published_at: " ~ searchResult["published_at"].str, ["debug"]);
+				}
+				publishedDate = searchResult["published_at"].str;
+			}
+		}
+		
+		if (publishedDate.empty) {
+			// empty .. no version match ?
+			// set to v2.0.0 release date
+			if (debugLogging) {addLogEntry("'published_at' unavailable in JSON response. Setting GitHub 'published_at' date to 2018-07-18T18:00:00Z", ["debug"]);}
+			publishedDate = "2018-07-18T18:00:00Z";
+		}
+	} else {
+		// JSONValue is not an Array
+		if (debugLogging) {addLogEntry("Invalid JSON Array. Setting GitHub 'published_at' date to 2018-07-18T18:00:00Z", ["debug"]);}
+		publishedDate = "2018-07-18T18:00:00Z";
+	}
+		
+	// return the latest github version and published date as our own JSON
+	versionDetails = [
+		"versionTag": JSONValue(thisVersion),
+		"publishedDate": JSONValue(publishedDate)
+	];
+	// versionDetails owns the extracted scalar values; release the GitHub response tree.
+	githubDetails = null;
+	
+	// return JSON
+	return versionDetails;
 }
 
 // Check the application version versus GitHub latestTag
 void checkApplicationVersion() {
-	// calculate if the client is current version or not
-	string latestVersion = strip(getLatestReleaseVersion());
+	// Get the latest details from GitHub
+	JSONValue latestVersionDetails = getLatestReleaseDetails();
+	string latestVersion = latestVersionDetails["latestTag"].str;
+	SysTime publishedDate = SysTime.fromISOExtString(latestVersionDetails["publishedDate"].str).toUTC();
+	SysTime releaseGracePeriod = publishedDate;
+	SysTime currentTime = Clock.currTime().toUTC();
+	// Required version metadata has been extracted into scalar values.
+	latestVersionDetails = null;
+	
+	// drop fraction seconds
+	publishedDate.fracSecs = Duration.zero;
+	currentTime.fracSecs = Duration.zero;
+	releaseGracePeriod.fracSecs = Duration.zero;
+	// roll the grace period forward to allow distributions to catch up based on their release cycles
+	releaseGracePeriod = releaseGracePeriod.add!"months"(1);
+
+	// what is this clients version?
 	auto currentVersionArray = strip(strip(import("version"), "v")).split("-");
 	string applicationVersion = currentVersionArray[0];
 	
-	// display warning if not current
+	// debug output
+	if (debugLogging) {
+		addLogEntry("applicationVersion:       " ~ applicationVersion, ["debug"]);
+		addLogEntry("latestVersion:            " ~ latestVersion, ["debug"]);
+		addLogEntry("publishedDate:            " ~ to!string(publishedDate), ["debug"]);
+		addLogEntry("currentTime:              " ~ to!string(currentTime), ["debug"]);
+		addLogEntry("releaseGracePeriod:       " ~ to!string(releaseGracePeriod), ["debug"]);
+	}
+	
+	// display details if not current
+	// is application version is older than available on GitHub
 	if (applicationVersion != latestVersion) {
-		// is application version is older than available on GitHub
+		// application version is different
+		bool displayObsolete = false;
+		
+		// what warning do we present?
 		if (applicationVersion < latestVersion) {
-			// application version is obsolete and unsupported
-			writeln();
-			log.logAndNotify("WARNING: Your onedrive client version is obsolete and unsupported. Please upgrade your client version.");
-			log.vlog("Application version: ", applicationVersion);
-			log.vlog("Version available:   ", latestVersion);
-			writeln();
+			// go get this running version details
+			JSONValue thisVersionDetails = getCurrentVersionDetails(applicationVersion);
+			SysTime thisVersionPublishedDate = SysTime.fromISOExtString(thisVersionDetails["publishedDate"].str).toUTC();
+			thisVersionDetails = null;
+			thisVersionPublishedDate.fracSecs = Duration.zero;
+			if (debugLogging) {addLogEntry("thisVersionPublishedDate: " ~ to!string(thisVersionPublishedDate), ["debug"]);}
+			
+			// the running version grace period is its release date + 1 month
+			SysTime thisVersionReleaseGracePeriod = thisVersionPublishedDate;
+			thisVersionReleaseGracePeriod = thisVersionReleaseGracePeriod.add!"months"(1);
+			if (debugLogging) {addLogEntry("thisVersionReleaseGracePeriod: " ~ to!string(thisVersionReleaseGracePeriod), ["debug"]);}
+			
+			// Is this running version obsolete ?
+			if (!displayObsolete) {
+				// if releaseGracePeriod > currentTime
+				// display an information warning that there is a new release available
+				if (releaseGracePeriod.toUnixTime() > currentTime.toUnixTime()) {
+					// inside release grace period ... set flag to false
+					displayObsolete = false;
+				} else {
+					// outside grace period
+					displayObsolete = true;
+				}
+			}
+			
+			// display version response
+			addLogEntry();
+			if (!displayObsolete) {
+				// display the new version is available message
+				addLogEntry("INFO: A new onedrive client version is available. Please upgrade your client version when possible.", ["info", "notify"]);
+			} else {
+				// display the obsolete message
+				addLogEntry("WARNING: Your onedrive client version is now obsolete and unsupported. Please upgrade your client version.", ["info", "notify"]);
+			}
+			addLogEntry("Current Application Version: " ~ applicationVersion);
+			addLogEntry("Version Available:           " ~ latestVersion);
+			addLogEntry();
 		}
 	}
 }
 
-// Unit Tests
-unittest
-{
-	assert(multiGlobMatch(".hidden", ".*"));
-	assert(multiGlobMatch(".hidden", "file|.*"));
-	assert(!multiGlobMatch("foo.bar", "foo|bar"));
-	// that should detect invalid file/directory name.
-	assert(isValidName("."));
-	assert(isValidName("./general.file"));
-	assert(!isValidName("./ leading_white_space"));
-	assert(!isValidName("./trailing_white_space "));
-	assert(!isValidName("./trailing_dot."));
-	assert(!isValidName("./includes<in the path"));
-	assert(!isValidName("./includes>in the path"));
-	assert(!isValidName("./includes:in the path"));
-	assert(!isValidName(`./includes"in the path`));
-	assert(!isValidName("./includes|in the path"));
-	assert(!isValidName("./includes?in the path"));
-	assert(!isValidName("./includes*in the path"));
-	assert(!isValidName("./includes / in the path"));
-	assert(!isValidName(`./includes\ in the path`));
-	assert(!isValidName(`./includes\\ in the path`));
-	assert(!isValidName(`./includes\\\\ in the path`));
-	assert(!isValidName("./includes\\ in the path"));
-	assert(!isValidName("./includes\\\\ in the path"));
-	assert(!isValidName("./CON"));
-	assert(!isValidName("./CON.text"));
-	assert(!isValidName("./PRN"));
-	assert(!isValidName("./AUX"));
-	assert(!isValidName("./NUL"));
-	assert(!isValidName("./COM0"));
-	assert(!isValidName("./COM1"));
-	assert(!isValidName("./COM2"));
-	assert(!isValidName("./COM3"));
-	assert(!isValidName("./COM4"));
-	assert(!isValidName("./COM5"));
-	assert(!isValidName("./COM6"));
-	assert(!isValidName("./COM7"));
-	assert(!isValidName("./COM8"));
-	assert(!isValidName("./COM9"));
-	assert(!isValidName("./LPT0"));
-	assert(!isValidName("./LPT1"));
-	assert(!isValidName("./LPT2"));
-	assert(!isValidName("./LPT3"));
-	assert(!isValidName("./LPT4"));
-	assert(!isValidName("./LPT5"));
-	assert(!isValidName("./LPT6"));
-	assert(!isValidName("./LPT7"));
-	assert(!isValidName("./LPT8"));
-	assert(!isValidName("./LPT9"));
+bool hasId(JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("id" in item) != null) &&
+		   (item["id"].type == JSONType.string);
+}
+
+bool hasMimeType(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("file" in item) != null) &&
+		   (item["file"].type == JSONType.object) &&
+		   (("mimeType" in item["file"]) != null) &&
+		   (item["file"]["mimeType"].type == JSONType.string);
+}
+
+bool hasQuota(JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("quota" in item) != null) &&
+		   (item["quota"].type == JSONType.object);
+}
+
+bool hasQuotaState(JSONValue item) {
+	return hasQuota(item) &&
+		   (("state" in item["quota"]) != null) &&
+		   (item["quota"]["state"].type == JSONType.string);
+}
+
+bool isItemDeleted(JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("deleted" in item) != null) &&
+		   (item["deleted"].type == JSONType.object);
+}
+
+bool isItemRoot(JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("root" in item) != null) &&
+		   (item["root"].type == JSONType.object);
+}
+
+bool hasParentReference(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("parentReference" in item) != null) &&
+		   (item["parentReference"].type == JSONType.object);
+}
+
+bool hasParentReferenceDriveId(JSONValue item) {
+	return hasParentReference(item) &&
+		   (("driveId" in item["parentReference"]) != null) &&
+		   (item["parentReference"]["driveId"].type == JSONType.string);
+}
+
+bool hasParentReferenceId(JSONValue item) {
+	return hasParentReference(item) &&
+		   (("id" in item["parentReference"]) != null) &&
+		   (item["parentReference"]["id"].type == JSONType.string);
+}
+
+bool hasParentReferencePath(JSONValue item) {
+	return hasParentReference(item) &&
+		   (("path" in item["parentReference"]) != null) &&
+		   (item["parentReference"]["path"].type == JSONType.string);
+}
+
+bool isFolderItem(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("folder" in item) != null) &&
+		   (item["folder"].type == JSONType.object);
+}
+
+bool isRemoteFolderItem(const ref JSONValue item) {
+	return isItemRemote(item) &&
+		   (("folder" in item["remoteItem"]) != null) &&
+		   (item["remoteItem"]["folder"].type == JSONType.object);
+}
+
+bool isFileItem(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("file" in item) != null) &&
+		   (item["file"].type == JSONType.object);
+}
+
+bool isItemRemote(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("remoteItem" in item) != null) &&
+		   (item["remoteItem"].type == JSONType.object);
+}
+
+// Check if ["remoteItem"]["parentReference"]["driveId"] exists and is a string
+bool hasRemoteParentDriveId(const ref JSONValue item) {
+	return isItemRemote(item) &&
+		   (("parentReference" in item["remoteItem"]) != null) &&
+		   (item["remoteItem"]["parentReference"].type == JSONType.object) &&
+		   (("driveId" in item["remoteItem"]["parentReference"]) != null) &&
+		   (item["remoteItem"]["parentReference"]["driveId"].type == JSONType.string);
+}
+
+// Check if ["remoteItem"]["id"] exists and is a string
+bool hasRemoteItemId(const ref JSONValue item) {
+	return isItemRemote(item) &&
+		   (("id" in item["remoteItem"]) != null) &&
+		   (item["remoteItem"]["id"].type == JSONType.string);
+}
+
+// Check if ["fileSystemInfo"]["lastModifiedDateTime"] exists and is a string
+bool hasFileSystemInfoLastModifiedDateTime(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("fileSystemInfo" in item) != null) &&
+		   (item["fileSystemInfo"].type == JSONType.object) &&
+		   (("lastModifiedDateTime" in item["fileSystemInfo"]) != null) &&
+		   (item["fileSystemInfo"]["lastModifiedDateTime"].type == JSONType.string);
+}
+
+// Check if ["remoteItem"]["fileSystemInfo"]["lastModifiedDateTime"] exists and is a string
+bool hasRemoteFileSystemInfoLastModifiedDateTime(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("remoteItem" in item) != null) &&
+		   (item["remoteItem"].type == JSONType.object) &&
+		   (("fileSystemInfo" in item["remoteItem"]) != null) &&
+		   (item["remoteItem"]["fileSystemInfo"].type == JSONType.object) &&
+		   (("lastModifiedDateTime" in item["remoteItem"]["fileSystemInfo"]) != null) &&
+		   (item["remoteItem"]["fileSystemInfo"]["lastModifiedDateTime"].type == JSONType.string);
+}
+
+// Extract and validate the authoritative filesystem last-modified timestamp from a live
+// Microsoft Graph DriveItem. Remote items normally carry this value under remoteItem,
+// but Add Shortcut to My Files objects may only expose it on the outer DriveItem (#1533).
+//
+// IMPORTANT: this function never fabricates a timestamp. A missing or invalid timestamp
+// is reported to the caller so that the item can be rejected or deferred safely.
+bool getFileSystemInfoLastModifiedDateTime(const ref JSONValue item, out SysTime parsedTime, out string timestamp) {
+	timestamp = "";
+
+	if (isItemRemote(item) && hasRemoteFileSystemInfoLastModifiedDateTime(item)) {
+		timestamp = strip(item["remoteItem"]["fileSystemInfo"]["lastModifiedDateTime"].str);
+	} else if (hasFileSystemInfoLastModifiedDateTime(item)) {
+		// Normal non-remote item, or #1533 fallback for a remote shortcut whose
+		// remoteItem does not contain fileSystemInfo.
+		timestamp = strip(item["fileSystemInfo"]["lastModifiedDateTime"].str);
+	} else {
+		return false;
+	}
+
+	return parseUTCDateTime(timestamp, parsedTime);
+}
+
+bool isItemFile(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("file" in item) != null) &&
+		   (item["file"].type == JSONType.object);
+}
+
+bool isItemFolder(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("folder" in item) != null) &&
+		   (item["folder"].type == JSONType.object);
+}
+
+bool hasFileSize(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("size" in item) != null) &&
+		   (item["size"].type == JSONType.integer);
+}
+
+// Function to determine if the final component of the provided path is a .file or .folder
+bool isDotFile(const(string) path) {
+	// Check for null or empty path
+	if (path is null || path.length == 0) {
+		return false;
+	}
+
+	// Special case for root
+	if (path == ".") {
+		return false;
+	}
+
+	// Extract the last component of the path
+	auto paths = pathSplitter(buildNormalizedPath(path));
+
+	// Optimised way to fetch the last component
+	string lastComponent = paths.empty ? "" : paths.back;
+
+	// Check if the last component starts with a dot
+	return startsWith(lastComponent, ".");
+}
+
+bool isMalware(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("malware" in item) != null) &&
+		   (item["malware"].type == JSONType.object);
+}
+
+bool isOneNotePackageFolder(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("package" in item) != null) &&
+		   (item["package"].type == JSONType.object) &&
+		   (("type" in item["package"]) != null) &&
+		   (item["package"]["type"].type == JSONType.string) &&
+		   (item["package"]["type"].str == "oneNote");
+}
+
+bool hasHashes(const ref JSONValue item) {
+	return isFileItem(item) &&
+		   (("hashes" in item["file"]) != null) &&
+		   (item["file"]["hashes"].type == JSONType.object);
+}
+
+bool hasZeroHashes(const ref JSONValue item) {
+	return hasHashes(item) &&
+		   (item["file"]["hashes"].object.keys.length == 0);
+}
+
+bool hasQuickXorHash(const ref JSONValue item) {
+	return hasHashes(item) &&
+		   (("quickXorHash" in item["file"]["hashes"]) != null) &&
+		   (item["file"]["hashes"]["quickXorHash"].type == JSONType.string);
+}
+
+bool hasSHA256Hash(const ref JSONValue item) {
+	return hasHashes(item) &&
+		   (("sha256Hash" in item["file"]["hashes"]) != null) &&
+		   (item["file"]["hashes"]["sha256Hash"].type == JSONType.string);
+}
+
+bool isMicrosoftOneNoteMimeType1(const ref JSONValue item) {
+	return hasMimeType(item) &&
+		   (item["file"]["mimeType"].str == "application/msonenote");
+}
+
+bool isMicrosoftOneNoteMimeType2(const ref JSONValue item) {
+	return hasMimeType(item) &&
+		   (item["file"]["mimeType"].str == "application/octet-stream");
+}
+
+bool isMicrosoftOneNoteFileExtensionType1(const ref JSONValue item) {
+	return hasName(item) &&
+		   item["name"].str.endsWith(".one");
+}
+
+bool isMicrosoftOneNoteFileExtensionType2(const ref JSONValue item) {
+	return hasName(item) &&
+		   item["name"].str.endsWith(".onetoc2");
+}
+
+bool hasUploadURL(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("uploadUrl" in item) != null) &&
+		   (item["uploadUrl"].type == JSONType.string);
+}
+
+bool hasNextExpectedRanges(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("nextExpectedRanges" in item) != null) &&
+		   (item["nextExpectedRanges"].type == JSONType.array) &&
+		   (item["nextExpectedRanges"].array.length > 0) &&
+		   (item["nextExpectedRanges"].array[0].type == JSONType.string);
+}
+
+bool hasLocalPath(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("localPath" in item) != null) &&
+		   (item["localPath"].type == JSONType.string);
+}
+
+bool hasETag(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("eTag" in item) != null) &&
+		   (item["eTag"].type == JSONType.string);
+}
+
+bool hasSharedElement(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("shared" in item) != null) &&
+		   (item["shared"].type == JSONType.object);
+}
+
+bool hasName(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("name" in item) != null) &&
+		   (item["name"].type == JSONType.string);
+}
+
+bool hasCreatedBy(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("createdBy" in item) != null) &&
+		   (item["createdBy"].type == JSONType.object);
+}
+
+bool hasCreatedByUser(const ref JSONValue item) {
+	return hasCreatedBy(item) &&
+		   (("user" in item["createdBy"]) != null) &&
+		   (item["createdBy"]["user"].type == JSONType.object);
+}
+
+bool hasCreatedByUserDisplayName(const ref JSONValue item) {
+	return hasCreatedByUser(item) &&
+		   (("displayName" in item["createdBy"]["user"]) != null) &&
+		   (item["createdBy"]["user"]["displayName"].type == JSONType.string);
+}
+
+bool hasLastModifiedBy(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("lastModifiedBy" in item) != null) &&
+		   (item["lastModifiedBy"].type == JSONType.object);
+}
+
+bool hasLastModifiedByUser(const ref JSONValue item) {
+	return hasLastModifiedBy(item) &&
+		   (("user" in item["lastModifiedBy"]) != null) &&
+		   (item["lastModifiedBy"]["user"].type == JSONType.object);
+}
+
+bool hasLastModifiedByUserDisplayName(const ref JSONValue item) {
+	return hasLastModifiedByUser(item) &&
+		   (("displayName" in item["lastModifiedBy"]["user"]) != null) &&
+		   (item["lastModifiedBy"]["user"]["displayName"].type == JSONType.string);
+}
+
+// Check Intune JSON response for 'accessToken'
+bool hasAccessTokenData(const ref JSONValue item) {
+	return ("accessToken" in item) != null;
+}
+
+// Check Intune JSON response for 'account'
+bool hasAccountData(const ref JSONValue item) {
+	return ("account" in item) != null;
+}
+
+// Check Intune JSON response for 'expiresOn'
+bool hasExpiresOn(const ref JSONValue item) {
+	return ("expiresOn" in item) != null;
+}
+
+// Resumable Download checks
+bool hasDriveId(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("driveId" in item) != null) &&
+		   (item["driveId"].type == JSONType.string);
+}
+
+bool hasItemId(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("itemId" in item) != null) &&
+		   (item["itemId"].type == JSONType.string);
+}
+
+bool hasDownloadFilename(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("downloadFilename" in item) != null) &&
+		   (item["downloadFilename"].type == JSONType.string);
+}
+
+bool hasResumeOffset(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("resumeOffset" in item) != null) &&
+		   (item["resumeOffset"].type == JSONType.string);
+}
+
+bool hasOnlineHash(const ref JSONValue item) {
+	return (item.type == JSONType.object) &&
+		   (("onlineHash" in item) != null) &&
+		   (item["onlineHash"].type == JSONType.object);
+}
+
+bool hasQuickXorHashResume(const ref JSONValue item) {
+	return hasOnlineHash(item) &&
+		   (("quickXorHash" in item["onlineHash"]) != null) &&
+		   (item["onlineHash"]["quickXorHash"].type == JSONType.string);
+}
+
+bool hasSHA256HashResume(const ref JSONValue item) {
+	return hasOnlineHash(item) &&
+		   (("sha256Hash" in item["onlineHash"]) != null) &&
+		   (item["onlineHash"]["sha256Hash"].type == JSONType.string);
+}
+
+// Test if a path is the equivalent of root '.'
+bool isRootEquivalent(string inputPath) {
+	auto normalisedPath = buildNormalizedPath(inputPath);
+	return normalisedPath == "." || normalisedPath == "";
+}
+
+// Convert bytes to GB
+string byteToGibiByte(ulong bytes) {
+	if (bytes == 0) {
+		return "0.00"; // or handle the zero case as needed
+	}
+
+	double gib = bytes / 1073741824.0; // 1024^3 for direct conversion
+	return format("%.2f", gib); // Format to ensure two decimal places
+}
+
+// Test if entrypoint.sh exists on the root filesystem
+bool entrypointExists(string basePath = "/") {
+	try {
+		// Build the path to the entrypoint.sh file
+		string entrypointPath = buildNormalizedPath(buildPath(basePath, "entrypoint.sh"));
+
+		// Check if the path exists and return the result
+		return exists(entrypointPath);
+	} catch (Exception e) {
+		// Handle any exceptions (e.g., permission issues, invalid path)
+		addLogEntry("An error occurred: " ~ e.msg);
+		return false;
+	}
+}
+
+// Generate a random alphanumeric string with specified length
+string generateAlphanumericString(size_t length = 16) {
+	// Ensure length is not zero
+	if (length == 0) {
+		throw new Exception("Length must be greater than 0");
+	}
+
+	auto asciiLetters = to!(dchar[])(letters);
+	auto asciiDigits = to!(dchar[])(digits);
+	dchar[] randomString;
+	randomString.length = length;
+
+	// Create a random number generator
+	auto rndGen = Random(unpredictableSeed);
+
+	// Fill the string with random alphanumeric characters
+	fill(randomString[], randomCover(chain(asciiLetters, asciiDigits), rndGen));
+
+	return to!string(randomString);
+}
+
+// Generate a cryptographically secure random hexadecimal string from 'byteCount' bytes of
+// randomness provided by the Linux kernel (/dev/urandom). Unlike generateAlphanumericString(),
+// the output is suitable for security sensitive values such as OAuth 'state' parameters.
+// If secure random data cannot be obtained, an Exception is thrown - there is deliberately no
+// fallback to a non-cryptographic random number generator.
+string generateCryptographicallySecureHexString(size_t byteCount = 16) {
+	// Ensure the byte count is not zero
+	if (byteCount == 0) {
+		throw new Exception("Byte count must be greater than 0");
+	}
+
+	ubyte[] randomBytes = new ubyte[byteCount];
+	auto randomSource = File("/dev/urandom", "rb");
+	scope(exit) randomSource.close();
+
+	// Read the requested number of bytes - a short read is treated as a failure
+	auto bytesRead = randomSource.rawRead(randomBytes);
+	if (bytesRead.length != byteCount) {
+		throw new Exception("Unable to read sufficient secure random data");
+	}
+
+	return format("%(%02x%)", randomBytes);
+}
+
+// Display internal memory stats and RSS details
+void displayMemoryUsageDetails() {
+	// The Resident Set Size (RSS) represents the amount of physical memory currently
+	// mapped into the process address space. RSS includes application data, runtime
+	// allocations, thread stacks, shared libraries, memory-mapped files, allocator
+	// arenas, and other memory retained by the process.
+	//
+	// RSS does not directly indicate active memory usage. Memory that has been
+	// allocated and retained for future reuse may continue to contribute to RSS even
+	// when it is no longer actively being used by the application.
+	//
+	// Long-running applications may experience changes in RSS as workload patterns
+	// change, internal caches grow or shrink, and the runtime adjusts heap capacity.
+	// As such, RSS should be observed as a trend over time rather than interpreted as
+	// an indication of current memory demand or the presence of a memory leak.
+	
+	addLogEntry();
+	addLogEntry("Memory Usage (KB)");
+	addLogEntry("-----------------------------------------------------");
+	addLogEntry("current memory usedSize                  = " ~ to!string((GC.stats.usedSize/1024))); // Amount of GC-managed heap memory currently occupied by live objects
+	addLogEntry("current memory freeSize                  = " ~ to!string((GC.stats.freeSize/1024))); // Amount of GC-managed heap memory currently reserved and available for future allocations
+	addLogEntry("current memory allocatedInCurrentThread  = " ~ to!string((GC.stats.allocatedInCurrentThread/1024))); // Running total of memory allocated by this thread; this value is cumulative and does not indicate current memory usage
+	
+	// Query the actual Resident Set Size (RSS) for the PID
+	pid_t pid = getCurrentPID();
+	ulong currentRSS;
+	version (FreeBSD) {
+		currentRSS = getRSSFreeBSD(pid);
+	} else version (OpenBSD) {
+		currentRSS = getRSSOpenBSD(pid);
+	} else version (linux) {
+		currentRSS = getRSSLinux(pid);
+	} else {
+		currentRSS = getRSS(pid);
+	}
+	
+	if (currentRSS != 0) {
+		addLogEntry("current Resident Set Size (RSS)          = " ~ to!string(currentRSS) ~ " KB");
+		
+		// Calculate difference
+		if (previousRSS != 0) {
+			addLogEntry("previous Resident Set Size (RSS)         = " ~ to!string(previousRSS) ~ " KB");
+			// Delta between current and previous RSS
+			long rssDifference = cast(long) currentRSS - cast(long) previousRSS;
+			string sign = rssDifference > 0 ? "+" : (rssDifference < 0 ? "" : "");
+			addLogEntry("difference in Resident Set Size (RSS)    = " ~ sign ~ to!string(rssDifference) ~ " KB");
+		}
+		
+		// Update the previous RSS value only after a valid RSS sample
+		previousRSS = currentRSS;
+	} else {
+		addLogEntry("current Resident Set Size (RSS)          = unavailable");
+	}
+	
+	addLogEntry("-----------------------------------------------------");
+	addLogEntry();
+}
+
+// Return the username of the UID running the 'onedrive' process
+string getUserName() {
+	// Retrieve the UID of the current user
+	auto uid = getuid();
+
+	// Retrieve password file entry for the user
+	auto pw = getpwuid(uid);
+	
+	// If user info is not found (e.g. no /etc/passwd entry), fallback to environment
+	if (pw is null) {
+		if (debugLogging) {
+			addLogEntry("Unable to retrieve user info for UID: " ~ to!string(uid), ["debug"]);
+			addLogEntry("Falling back to environment variable USER or returning 'unknown'", ["debug"]);
+		}
+
+		// Try environment variable
+		string userEnv = environment.get("USER", "unknown");
+		return userEnv.length > 0 ? userEnv : "unknown";
+	}
+	
+	// If pw is valid, we can safely access pw.pw_name
+	string userName = to!string(fromStringz(pw.pw_name));
+
+	// Log User identifiers from process
+	if (debugLogging) {
+		addLogEntry("Process ID: " ~ to!string(pw), ["debug"]);
+		addLogEntry("User UID:   " ~ to!string(pw.pw_uid), ["debug"]);
+		addLogEntry("User GID:   " ~ to!string(pw.pw_gid), ["debug"]);
+	}
+
+	// Check if username is valid
+	if (!userName.empty) {
+		if (debugLogging) {addLogEntry("User Name:  " ~ userName, ["debug"]);}
+		return userName;
+	} else {
+		// Log and return unknown user
+		if (debugLogging) {addLogEntry("User Name:  unknown", ["debug"]);}
+		return "unknown";
+	}
+}
+
+// Get resource limit in POSIX portable manner (soft limit max open files)
+ulong getSoftOpenFilesLimit() {
+	rlimit lim;
+	if (getrlimit(RLIMIT_NOFILE, &lim) == 0)
+		return cast(ulong) lim.rlim_cur; // soft limit
+	return 0;
+}
+
+// Get resource limit in POSIX portable manner (hard limit max open files)
+ulong getHardOpenFilesLimit() {
+	rlimit lim;
+	if (getrlimit(RLIMIT_NOFILE, &lim) == 0)
+		return cast(ulong) lim.rlim_max; // hard limit
+	return 0; // or throw / handle error
+}
+
+// Calculate the ETA for when a 'large file' will be completed (upload & download operations)
+int calc_eta(size_t counter, size_t iterations, long start_time) {
+	if (counter == 0) {
+		return 0; // Avoid division by zero
+	}
+	
+	// Get the current time as a Unix timestamp (seconds since the epoch, January 1, 1970, 00:00:00 UTC)
+	SysTime currentTime = Clock.currTime();
+	long current_time = currentTime.toUnixTime();
+
+	// 'start_time' must be less than 'current_time' otherwise ETA will have negative values
+	if (start_time > current_time) {
+		if (debugLogging) {
+			addLogEntry("Warning: start_time is in the future. Cannot calculate ETA.", ["debug"]);
+		}
+		return 0;
+	}
+	
+	// Calculate duration
+	long duration = (current_time - start_time);
+
+	// Calculate the ratio we are at
+	double ratio = cast(double) counter / iterations;
+
+	// Calculate segments left to download
+	auto segments_remaining = (iterations > counter) ? (iterations - counter) : 0;
+
+	// Calculate the average time per iteration so far
+	double avg_time_per_iteration = cast(double) duration / counter;
+
+	// Debug output for the ETA calculation
+	if (debugLogging) {
+		addLogEntry("counter:                " ~ to!string(counter), ["debug"]);
+		addLogEntry("iterations:             " ~ to!string(iterations), ["debug"]);
+		addLogEntry("segments_remaining:     " ~ to!string(segments_remaining), ["debug"]);
+		addLogEntry("ratio:                  " ~ format("%.2f", ratio), ["debug"]);
+		addLogEntry("start_time:             " ~ to!string(start_time), ["debug"]);
+		addLogEntry("current_time:           " ~ to!string(current_time), ["debug"]);
+		addLogEntry("duration:               " ~ to!string(duration), ["debug"]);
+		addLogEntry("avg_time_per_iteration: " ~ format("%.2f", avg_time_per_iteration), ["debug"]);
+	}
+	
+	// Return the ETA or duration
+	if (counter != iterations) {
+		auto eta_sec = avg_time_per_iteration * segments_remaining;
+		// ETA Debug
+		if (debugLogging) {
+			addLogEntry("eta_sec:                " ~ to!string(eta_sec), ["debug"]);
+			addLogEntry("estimated_total_time:   " ~ to!string(avg_time_per_iteration * iterations), ["debug"]);
+		}
+		// Return ETA
+		return eta_sec > 0 ? cast(int) ceil(eta_sec) : 0;
+	} else {
+		// Return the average time per iteration for the last iteration
+		return cast(int) ceil(avg_time_per_iteration); 
+	}
+}
+
+// Use the ETA value and return a formatted string in a consistent manner
+string formatETA(int eta) {
+	// How do we format the ETA string. Guard against zero and negative values
+	if (eta <= 0) {
+		return "|  ETA    --:--:--";
+	}
+	int h, m, s;
+	dur!"seconds"(eta).split!("hours", "minutes", "seconds")(h, m, s);
+	return format!"|  ETA    %02d:%02d:%02d"(h, m, s);
+}
+
+// Force Exit due to failure
+void forceExit(int exitCode = EXIT_FAILURE) {
+	// Allow any logging complete before we force exit
+	Thread.sleep(dur!("msecs")(500));
+	// Shutdown logging, which also flushes all logging buffers
+	shutdownLogging();
+	// Setup signal handling for the exit scope
+	setupExitScopeSignalHandler();
+	// Force Exit
+	_exit(exitCode);
+}
+
+// Get the current PID of the application
+pid_t getCurrentPID() {
+	return getpid();
+}
+
+// Access the Resident Set Size (RSS) based on the PID of the running application
+ulong getRSS(pid_t pid) {
+	version (FreeBSD) {
+		return getRSSFreeBSD(pid);
+	} else version (OpenBSD) {
+		return getRSSOpenBSD(pid);
+	} else version (linux) {
+		return getRSSLinux(pid);
+	} else {
+		return 0;
+	}
+}
+
+// Access the Resident Set Size (RSS) using the Linux /proc filesystem
+ulong getRSSLinux(pid_t pid) {
+	if (pid <= 0) {
+		return 0;
+	}
+	
+	// Construct the path to the statm file for the given PID
+	string path = format("/proc/%s/statm", to!string(pid));
+
+	// Read the content of the file
+	string content;
+	try {
+		content = readText(path);
+	} catch (Exception e) {
+		addLogEntry("Failed to read statm file: " ~ e.msg);
+		return 0;
+	}
+
+	// Split the content and get the RSS (second value)
+	auto stats = split(content);
+	if (stats.length < 2) {
+		addLogEntry("Unexpected format in statm file: " ~ path);
+		return 0;
+	}
+
+	// RSS is in pages, convert it to kilobytes
+	ulong rssPages;
+	try {
+		rssPages = to!ulong(stats[1]);
+	} catch (Exception e) {
+		addLogEntry("Failed to parse RSS page count from statm file: " ~ path ~ " : " ~ e.msg);
+		return 0;
+	}
+	
+	auto pageSize = sysconf(_SC_PAGESIZE);
+	if (pageSize <= 0) {
+		addLogEntry("Failed to determine system page size while calculating Linux RSS");
+		return 0;
+	}
+	
+	ulong rssKilobytes = (rssPages * cast(ulong) pageSize) / 1024;
+	return rssKilobytes;
+}
+
+// Access the Resident Set Size (RSS) using FreeBSD-native process telemetry
+ulong getRSSFreeBSD(pid_t pid) {
+	if (pid <= 0) {
+		return 0;
+	}
+	
+	version (FreeBSD) {
+		import core.sys.freebsd.sys.sysctl : CTL_KERN, KERN_PROC, KERN_PROC_PID, sysctl;
+		import core.sys.freebsd.sys.types : segsz_t, vm_size_t;
+		import core.sys.posix.signal : sigset_t;
+		import core.sys.posix.sys.types : gid_t, uid_t;
+		
+		// DRuntime does not expose sys/user.h as a portable kinfo_proc binding, so
+		// define only the stable kinfo_proc prefix required to reach ki_rssize.
+		// The full sysctl result is still queried into a correctly-sized byte buffer.
+		extern(C) struct FreeBSDKinfoProcRSSPrefix {
+			int ki_structsize;
+			int ki_layout;
+			void* ki_args;
+			void* ki_paddr;
+			void* ki_addr;
+			void* ki_tracep;
+			void* ki_textvp;
+			void* ki_fd;
+			void* ki_vmspace;
+			const(void)* ki_wchan;
+			pid_t ki_pid;
+			pid_t ki_ppid;
+			pid_t ki_pgid;
+			pid_t ki_tpgid;
+			pid_t ki_sid;
+			pid_t ki_tsid;
+			short ki_jobc;
+			short ki_spare_short1;
+			uint ki_tdev_freebsd11;
+			sigset_t ki_siglist;
+			sigset_t ki_sigmask;
+			sigset_t ki_sigignore;
+			sigset_t ki_sigcatch;
+			uid_t ki_uid;
+			uid_t ki_ruid;
+			uid_t ki_svuid;
+			gid_t ki_rgid;
+			gid_t ki_svgid;
+			short ki_ngroups;
+			short ki_spare_short2;
+			gid_t[16] ki_groups;
+			vm_size_t ki_size;
+			segsz_t ki_rssize;
+		}
+		
+		int[4] mib = [
+			CTL_KERN,
+			KERN_PROC,
+			KERN_PROC_PID,
+			cast(int) pid
+		];
+		
+		size_t processInfoLength;
+		if (sysctl(mib.ptr, cast(uint) mib.length, null, &processInfoLength, null, 0) != 0) {
+			addLogEntry("Failed to determine FreeBSD process RSS buffer size via sysctl for PID: " ~ to!string(pid));
+			return 0;
+		}
+		
+		if (processInfoLength < FreeBSDKinfoProcRSSPrefix.sizeof) {
+			addLogEntry("Failed to query FreeBSD process RSS via sysctl: returned process information is too small for PID: " ~ to!string(pid));
+			return 0;
+		}
+		
+		auto processInfo = new ubyte[](processInfoLength);
+		if (sysctl(mib.ptr, cast(uint) mib.length, processInfo.ptr, &processInfoLength, null, 0) != 0) {
+			addLogEntry("Failed to query FreeBSD process RSS via sysctl for PID: " ~ to!string(pid));
+			return 0;
+		}
+		
+		if (processInfoLength < FreeBSDKinfoProcRSSPrefix.sizeof) {
+			addLogEntry("Failed to query FreeBSD process RSS via sysctl: incomplete process information returned for PID: " ~ to!string(pid));
+			return 0;
+		}
+		
+		auto processInfoPrefix = cast(FreeBSDKinfoProcRSSPrefix*) processInfo.ptr;
+		auto pageSize = sysconf(_SC_PAGESIZE);
+		if (pageSize <= 0) {
+			addLogEntry("Failed to determine system page size while calculating FreeBSD RSS");
+			return 0;
+		}
+		
+		// FreeBSD reports ki_rssize in pages.
+		return (cast(ulong) processInfoPrefix.ki_rssize * cast(ulong) pageSize) / 1024;
+	} else {
+		return 0;
+	}
+}
+
+// Access the Resident Set Size (RSS) using OpenBSD-native process telemetry
+ulong getRSSOpenBSD(pid_t pid) {
+	if (pid <= 0) {
+		return 0;
+	}
+
+	version (OpenBSD) {
+		enum CTL_KERN = 1;
+		enum KERN_PROC = 66;
+		enum KERN_PROC_PID = 1;
+		enum KI_NGROUPS = 16;
+		enum KI_MAXCOMLEN = 24;
+		enum KI_WMESGLEN = 8;
+		enum KI_MAXLOGNAME = 32;
+
+		// DRuntime does not expose OpenBSD's sys/sysctl.h kinfo_proc binding.
+		// Define only the stable kinfo_proc prefix required to reach p_vm_rssize.
+		extern(C) struct OpenBSDKinfoProcRSSPrefix {
+			ulong p_forw;
+			ulong p_back;
+			ulong p_paddr;
+			ulong p_addr;
+			ulong p_fd;
+			ulong p_stats;
+			ulong p_limit;
+			ulong p_vmspace;
+			ulong p_sigacts;
+			ulong p_sess;
+			ulong p_tsess;
+			ulong p_ru;
+			int p_eflag;
+			int p_exitsig;
+			int p_flag;
+			int p_pid;
+			int p_ppid;
+			int p_sid;
+			int p__pgid;
+			int p_tpgid;
+			uint p_uid;
+			uint p_ruid;
+			uint p_gid;
+			uint p_rgid;
+			uint[KI_NGROUPS] p_groups;
+			short p_ngroups;
+			short p_jobc;
+			uint p_tdev;
+			uint p_estcpu;
+			uint p_rtime_sec;
+			uint p_rtime_usec;
+			int p_cpticks;
+			uint p_pctcpu;
+			uint p_swtime;
+			uint p_slptime;
+			int p_schedflags;
+			ulong p_uticks;
+			ulong p_sticks;
+			ulong p_iticks;
+			ulong p_tracep;
+			int p_traceflag;
+			int p_holdcnt;
+			int p_siglist;
+			uint p_sigmask;
+			uint p_sigignore;
+			uint p_sigcatch;
+			byte p_stat;
+			ubyte p_priority;
+			ubyte p_usrpri;
+			ubyte p_nice;
+			ushort p_xstat;
+			ushort p_spare;
+			char[KI_MAXCOMLEN] p_comm;
+			char[KI_WMESGLEN] p_wmesg;
+			ulong p_wchan;
+			char[KI_MAXLOGNAME] p_login;
+			int p_vm_rssize;
+		}
+
+		int[6] mib = [
+			CTL_KERN,
+			KERN_PROC,
+			KERN_PROC_PID,
+			cast(int) pid,
+			cast(int) OpenBSDKinfoProcRSSPrefix.sizeof,
+			1
+		];
+
+		size_t processInfoLength;
+		if (sysctl(mib.ptr, cast(uint) mib.length, null, &processInfoLength, null, 0) != 0) {
+			addLogEntry("Failed to determine OpenBSD process RSS buffer size via sysctl for PID: " ~ to!string(pid));
+			return 0;
+		}
+
+		if (processInfoLength < OpenBSDKinfoProcRSSPrefix.sizeof) {
+			addLogEntry("Failed to query OpenBSD process RSS via sysctl: returned process information is too small for PID: " ~ to!string(pid));
+			return 0;
+		}
+
+		auto processInfo = new ubyte[](processInfoLength);
+		if (sysctl(mib.ptr, cast(uint) mib.length, processInfo.ptr, &processInfoLength, null, 0) != 0) {
+			addLogEntry("Failed to query OpenBSD process RSS via sysctl for PID: " ~ to!string(pid));
+			return 0;
+		}
+
+		if (processInfoLength < OpenBSDKinfoProcRSSPrefix.sizeof) {
+			addLogEntry("Failed to query OpenBSD process RSS via sysctl: incomplete process information returned for PID: " ~ to!string(pid));
+			return 0;
+		}
+
+		auto processInfoPrefix = cast(OpenBSDKinfoProcRSSPrefix*) processInfo.ptr;
+		auto pageSize = sysconf(_SC_PAGESIZE);
+		if (pageSize <= 0) {
+			addLogEntry("Failed to determine system page size while calculating OpenBSD RSS");
+			return 0;
+		}
+
+		// OpenBSD reports p_vm_rssize in pages.
+		return (cast(ulong) processInfoPrefix.p_vm_rssize * cast(ulong) pageSize) / 1024;
+	} else {
+		return 0;
+	}
+}
+
+// Getting around the @nogc problem
+// https://p0nce.github.io/d-idioms/#Bypassing-@nogc
+auto assumeNoGC(T) (T t) if (isFunctionPointer!T || isDelegate!T) {
+	enum attrs = functionAttributes!T | FunctionAttribute.nogc;
+	return cast(SetFunctionAttributes!(T, functionLinkage!T, attrs)) t;
+}
+
+// When using exit scopes, set up this to catch any undesirable signal
+void setupExitScopeSignalHandler() {
+	sigaction_t action;
+	action.sa_handler = &exitScopeSignalHandler; // Direct function pointer assignment
+	sigemptyset(&action.sa_mask); // Initialize the signal set to empty
+	action.sa_flags = 0;
+	sigaction(SIGSEGV, &action, null); // Invalid Memory Access signal
+}
+
+// Catch any SIGSEGV generated during process shutdown.
+// A shutdown fault must never convert a failed application run into success.
+extern(C) nothrow @nogc @system void exitScopeSignalHandler(int signo) {
+	if (signo == SIGSEGV) {
+		// Do not call exit() from a signal handler because that can re-enter runtime
+		// shutdown handlers. Terminate immediately with the conventional SIGSEGV
+		// process status instead of incorrectly reporting EXIT_SUCCESS.
+		_exit(128 + SIGSEGV);
+	}
+}
+
+// Return the compiler details
+string compilerDetails() {
+	version(DigitalMars) enum compiler = "DMD";
+	else version(LDC)    enum compiler = "LDC";
+	else version(GNU)    enum compiler = "GDC";
+	else enum compiler = "Unknown compiler";
+	string compilerString = compiler ~ " " ~ to!string(__VERSION__);
+	return compilerString;
+}
+
+// Return the curl version details
+string getCurlVersionString() {
+	// Get curl version
+	auto versionInfo = curl_version();
+	return to!string(versionInfo);
+}
+
+// Function to return the decoded curl version as a string
+string getCurlVersionNumeric() {
+	// Get curl version info using curl_version_info
+	auto curlVersionDetails = curl_version_info(CURLVERSION_NOW);
+
+	// Extract the major, minor, and patch numbers from version_num
+	uint versionNum = curlVersionDetails.version_num;
+
+	// The version number is in the format 0xXXYYZZ
+	uint major = (versionNum >> 16) & 0xFF; // Extract XX (major version)
+	uint minor = (versionNum >> 8) & 0xFF;  // Extract YY (minor version)
+	uint patch = versionNum & 0xFF;         // Extract ZZ (patch version)
+
+	// Return the version in the format "major.minor.patch"
+	return major.to!string ~ "." ~ minor.to!string ~ "." ~ patch.to!string;
+}
+
+// Test the curl version against known curl versions with HTTP/2 issues
+bool isBadCurlVersion(string curlVersion) {
+	// List of known curl versions with HTTP/2 issues
+	string[] supportedVersions = [
+		"7.68.0", // Ubuntu 20.x
+		"7.74.0", // Debian 11
+		"7.81.0", // Ubuntu 22.x
+		"7.88.1", // Debian 12
+		"8.2.1",  // Ubuntu 23.10
+		"8.5.0",  // Ubuntu 24.04
+		"8.9.1",  // Ubuntu 24.10
+		"8.10.0",  // Various - HTTP/2 bug which was fixed in 8.10.1
+		"8.13.0",  // Has a SSL Certificate read issue fixed by 8.14.1
+		"8.13.1",  // Has a SSL Certificate read issue fixed by 8.14.1
+		"8.14.0",  // Has a SSL Certificate read issue fixed by 8.14.1
+	];
+
+	// Check if the current version matches one of the supported versions
+	return canFind(supportedVersions, curlVersion);
+}
+
+// Is the operation a transient error?
+private bool isTransientErrno(int err) @safe nothrow {
+	// EINTR: interrupted system call
+	// EBUSY: resource busy (can be transient on some FS / mount scenarios)
+	// EAGAIN: try again (transient)
+	return err == EINTR || err == EBUSY || err == EAGAIN;
+}
+
+// Retry wrapper for getTimes()
+private bool safeGetTimes(string path, out SysTime accessTime, out SysTime modTime, string thisFunctionName) {
+	int maxAttempts = 5;
+
+	foreach (attempt; 0 .. maxAttempts) {
+		try {
+			getTimes(path, accessTime, modTime);
+			return true;
+		} catch (FileException e) {
+			// If path vanished between checks / operations, treat as non-fatal for this workflow
+			if (e.errno == ENOENT) {
+				return false;
+			}
+
+			if (isTransientErrno(e.errno)) {
+				// bounded backoff to avoid spinning
+				Thread.sleep(dur!"msecs"(10 * (attempt + 1)));
+				continue;
+			}
+
+			displayFileSystemErrorMessage(e.msg, thisFunctionName, path);
+			return false;
+		}
+	}
+
+	displayFileSystemErrorMessage("Failed to read file timestamps after retries", thisFunctionName, path);
+	return false;
+}
+
+// Some errnos are 'expected' in the wild (permissions, RO mounts, immutable files)
+// What is this errno
+private bool isExpectedPermissionStyleErrno(int err) {
+	// Return true of this is an expected error due to permission issues
+	return err == EPERM || err == EACCES || err == EROFS;
+}
+
+// Helper function to determine path mismatch against UID|GID and process effective UID
+private bool getPathOwnerMismatch(string path, out uint fileUid, out uint effectiveUid) {
+	version (Posix) {
+		stat_t st;
+
+		// Default outputs
+		fileUid = 0;
+		effectiveUid = cast(uint) geteuid();
+
+		try {
+			// absolutePath can throw; keep this helper non-throwing
+			auto fullPath = absolutePath(path);
+
+			// Ensure we pass a NUL-terminated string to the C API
+			auto cpath = toStringz(fullPath);
+
+			if (lstat(cpath, &st) != 0) {
+				if (debugLogging) {
+					addLogEntry("getPathOwnerMismatch(): lstat() failed for '" ~ path ~ "'", ["debug"]);
+				}
+				return false;
+			}
+
+			fileUid = cast(uint) st.st_uid;
+			// effectiveUid already set above
+			return fileUid != effectiveUid;
+
+		} catch (Exception e) {
+			if (debugLogging) {
+				addLogEntry("getPathOwnerMismatch(): exception for '" ~ path ~ "': " ~ e.msg, ["debug"]);
+			}
+			return false;
+		}
+	} else {
+		fileUid = 0;
+		effectiveUid = 0;
+		return false;
+	}
+}
+
+// Retry wrapper for setTimes()
+private bool safeSetTimes(string path, SysTime accessTime, SysTime modTime, string thisFunctionName) {
+	
+	enum int maxAttempts = 5;
+
+	foreach (attempt; 0 .. maxAttempts) {
+		try {
+			setTimes(path, accessTime, modTime);
+			return true;
+		} catch (FileException e) {
+			// If the path disappeared before we could set, there's nothing useful to do
+			if (e.errno == ENOENT) {
+				return false;
+			}
+
+			// Transient filesystem error: retry with backoff
+			if (isTransientErrno(e.errno)) {
+				if (debugLogging) {
+					// Log that we hit a transient error when doing debugging, otherwise nothing
+					addLogEntry("safeSetTimes() transient filesystem error response: " ~ e.msg ~ "\n - Attempting retry for setTimes()", ["debug"]);
+				}
+				// Backoff and retry
+				Thread.sleep(dur!"msecs"(15 * (attempt + 1)));
+				continue;
+			}
+
+			// Non-transient: special-case common permission errors
+			// The user running the client needs to be the owner of the files if the client needs to set explicit timestamps
+			// See https://github.com/abraunegg/onedrive/issues/3651 for details
+			if (isExpectedPermissionStyleErrno(e.errno)) {
+				// Configure application message to display
+				string permissionErrorMessage = "Unable to set local file timestamps (mtime/atime): Operation not permitted";
+				if (e.errno == EPERM) {
+					permissionErrorMessage = permissionErrorMessage ~ " (EPERM)";
+				}
+				
+				if (e.errno == EACCES) {
+					permissionErrorMessage = permissionErrorMessage ~ " (EACCES)";
+				}
+				
+				if (e.errno == EROFS) {
+					permissionErrorMessage = permissionErrorMessage ~ " (EROFS)";
+				}
+				
+				// Get extra details if required
+				string extraHint;
+				uint fileUid;
+				uint effectiveUid;
+				
+				if (e.errno == EPERM && getPathOwnerMismatch(path, fileUid, effectiveUid)) {
+					extraHint =
+						"\nThe onedrive client user does not own this file. onedrive user effective UID=" ~ to!string(effectiveUid) ~ ", file owner UID=" ~ to!string(fileUid) ~ "." ~
+						"\nOn Unix-like systems, setting explicit file timestamps typically requires the process to be the file owner or run with sufficient privileges.";
+					
+					// Update permissionErrorMessage to add extraHint
+					permissionErrorMessage = permissionErrorMessage ~ extraHint;
+				}
+				
+				// If we are doing --verbose or --debug display this file system error
+				if (verboseLogging) {
+					// Display applicable message for the user regarding permission error on path
+					displayFileSystemErrorMessage(
+						permissionErrorMessage,
+						thisFunctionName,
+						path,
+						FsErrorSeverity.permission
+					);
+				}
+				
+				// It is pointless attempting a re-try in this scenario as those conditions will not change by retrying 15ms later.
+				return false;
+			}
+
+			// Everything else: preserve existing behaviour
+			displayFileSystemErrorMessage(e.msg, thisFunctionName, path);
+			return false;
+		}
+	}
+
+	// Only reached if transient errors never resolved
+	displayFileSystemErrorMessage("Failed to set path timestamps after retries", thisFunctionName, path);
+	return false;
+}
+
+// Set the timestamp of the provided path to ensure this is done in a consistent manner
+void setLocalPathTimestamp(bool dryRun, string inputPath, SysTime newTimeStamp) {
+	// Set this function name
+	string thisFunctionName = format("%s.%s", strip(__MODULE__), strip(getFunctionName!({})));
+
+	if (dryRun) {
+		// Keep behaviour consistent: do nothing in dry-run
+		return;
+	}
+
+	if (debugLogging) {
+		string logMessage = format("Setting 'lastAccessTime' and 'lastModificationTime' properties for: %s to %s if required", inputPath, to!string(newTimeStamp));
+		addLogEntry(logMessage, ["debug"]);
+	}
+
+	// Read existing times (with retry protection)
+	SysTime existingAccessTime;
+	SysTime existingModificationTime;
+
+	if (!safeGetTimes(inputPath, existingAccessTime, existingModificationTime, thisFunctionName)) {
+		// safeGetTimes already logged non-transient errors; ENOENT etc just returns false quietly
+		return;
+	}
+
+	if (debugLogging) {
+		addLogEntry("Existing timestamp values:", ["debug"]);
+		addLogEntry("  Access Time:       " ~ to!string(existingAccessTime), ["debug"]);
+		addLogEntry("  Modification Time: " ~ to!string(existingModificationTime), ["debug"]);
+	}
+
+	// Compare timestamps using UTC and truncated fractional seconds (OneDrive has no fractional seconds)
+	SysTime newTimeStampZeroFracSec = newTimeStamp.toUTC();
+	SysTime existingTimeStampZeroFracSec = existingModificationTime.toUTC();
+
+	newTimeStampZeroFracSec.fracSecs = Duration.zero;
+	existingTimeStampZeroFracSec.fracSecs = Duration.zero;
+
+	if (debugLogging) {
+		addLogEntry("Comparison timestamp values:", ["debug"]);
+		addLogEntry("  newTimeStampZeroFracSec =      " ~ to!string(newTimeStampZeroFracSec), ["debug"]);
+		addLogEntry("  existingTimeStampZeroFracSec = " ~ to!string(existingTimeStampZeroFracSec), ["debug"]);
+	}
+
+	// Only update if the whole-second timestamp differs
+	bool makeTimestampChange = (newTimeStampZeroFracSec != existingTimeStampZeroFracSec);
+
+	SysTime updatedModificationTime;
+	if (!makeTimestampChange) {
+		if (debugLogging) {
+			addLogEntry("Fractional seconds only difference in modification time; preserving existing modification time", ["debug"]);
+			addLogEntry("No local timestamp change required", ["debug"]);
+		}
+		return;
+	}
+
+	if (debugLogging) {
+		addLogEntry("New timestamp is different to existing timestamp; using new modification time", ["debug"]);
+		addLogEntry("Calling setTimes() for the given path", ["debug"]);
+	}
+
+	updatedModificationTime = newTimeStamp;
+
+	// Apply new timestamp
+	if (!safeSetTimes(inputPath, existingAccessTime, updatedModificationTime, thisFunctionName)) {
+		// safeSetTimes logs non-transient errors; ENOENT just returns false quietly
+		return;
+	}
+
+	if (debugLogging) {
+		addLogEntry("Timestamp updated for this path: " ~ inputPath, ["debug"]);
+	}
+	
+	// Post-check to ensure timestamp is set
+	SysTime newAccessTime;
+	SysTime newModificationTime;
+	if (safeGetTimes(inputPath, newAccessTime, newModificationTime, thisFunctionName) && debugLogging) {
+		addLogEntry("Current timestamp values post any change (if required):", ["debug"]);
+		addLogEntry("  Access Time:       " ~ to!string(newAccessTime), ["debug"]);
+		addLogEntry("  Modification Time: " ~ to!string(newModificationTime), ["debug"]);
+	}
+}
+
+// Generate the initial function processing time log entry
+void displayFunctionProcessingStart(string functionName, string logKey) {
+	// Output the function processing header
+	addLogEntry(format("[%s] Application Function '%s' Started", strip(logKey), strip(functionName)));
+}
+
+// Calculate the time taken to perform the application Function
+void displayFunctionProcessingTime(string functionName, SysTime functionStartTime, SysTime functionEndTime, string logKey) {
+	// Calculate processing time
+	auto functionDuration = functionEndTime - functionStartTime;
+	double functionDurationAsSeconds = (functionDuration.total!"msecs"/1e3); // msec --> seconds
+	
+	// Output the function processing time
+	string processingTime = format("[%s] Application Function '%s' Processing Time = %.4f Seconds", strip(logKey), strip(functionName), functionDurationAsSeconds);
+	addLogEntry(processingTime);
+}
+
+// Return true if `dir` exists and has no entries.
+// Symlinks are treated as non-removable.
+bool isDirEmpty(string dir) {
+	if (!exists(dir) || !isDir(dir) || isSymlink(dir)) return false;
+	foreach (_; dirEntries(dir, SpanMode.shallow)) {
+		// Found at least one entry
+		return false;
+	}
+	return true;
+}
+
+// Escape a string for literal use inside a regex
+string regexEscape(string s) {
+	auto b = appender!string();
+	foreach (c; s) {
+		// characters with special meaning in regex
+		immutable specials = "\\.^$|?*+()[]{}";
+		if (specials.canFind(c)) b.put('\\');
+		b.put(c);
+	}
+	return b.data;
 }

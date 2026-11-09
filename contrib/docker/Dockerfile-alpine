@@ -1,8 +1,8 @@
 # -*-Dockerfile-*-
 
-ARG ALPINE_VERSION=3.16
-ARG GO_VERSION=1.17
-ARG GOSU_VERSION=1.14
+ARG ALPINE_VERSION=3.24
+ARG GO_VERSION=1.27
+ARG GOSU_VERSION=1.19
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder-gosu
 ARG GOSU_VERSION
@@ -10,20 +10,23 @@ RUN go install -ldflags "-s -w" github.com/tianon/gosu@${GOSU_VERSION}
 
 FROM alpine:${ALPINE_VERSION} AS builder-onedrive
 
-RUN apk add --update --no-cache alpine-sdk gnupg xz curl-dev sqlite-dev binutils-gold autoconf automake ldc
+RUN apk add --update --no-cache alpine-sdk gnupg xz curl-dev sqlite-dev dbus-dev binutils-gold autoconf automake ldc
 
 COPY . /usr/src/onedrive
 WORKDIR /usr/src/onedrive
 
 RUN autoreconf -fiv \
- && ./configure \
+ && ./configure --enable-debug\
  && make clean \
  && make \
  && make install
 
 FROM alpine:${ALPINE_VERSION}
 
-RUN apk add --update --no-cache bash libcurl libgcc shadow sqlite-libs ldc-runtime  \
+RUN apk add --upgrade apk-tools \
+ && apk upgrade --available
+
+RUN apk add --update --no-cache bash libcurl libgcc shadow sqlite-libs ldc-runtime dbus-libs \
  && mkdir -p /onedrive/conf /onedrive/data
 
 COPY --from=builder-gosu /go/bin/gosu /usr/local/bin/

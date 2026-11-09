@@ -1,0 +1,109 @@
+@startuml
+title applyPotentiallyNewLocalItem()
+start
+
+note right
+  Input has already passed online filtering / scope checks
+  and the online item is not currently tracked as this identity.
+
+  "New" here means new to the database identity map. A local
+  pathname can already exist, so this path must not assume that
+  it is safe to overwrite whatever is on disk.
+end note
+
+if (Target path already exists locally?) then (yes)
+  if (Invalid symbolic link?) then (yes)
+    :Skip item;
+    stop
+  endif
+
+  :Call isItemSynced() using online item metadata;
+  if (Reported in sync?) then (yes)
+    if (File-like item has no trusted DB identity\nand content hash differs?) then (yes)
+      :Do not bind equal-timestamp but different content;
+      :Continue conflict reconciliation;
+      note right
+        Equal timestamps alone are not enough to prove
+        that an untracked local file is the same content.
+        This prevents the client from binding the wrong
+        local bytes to an online DriveItem identity.
+      end note
+    else (no)
+      :Upsert online identity / metadata into DB;
+      if (Remote/shared item?) then (yes)
+        :Create / update required shared-folder DB tie records;
+      endif
+      if (write_xattr_data enabled?) then (yes)
+        :Write OneDrive metadata to xattr;
+      endif
+      stop
+    endif
+  endif
+
+  :Compare local and online modification timestamps\nat whole-second resolution;
+  if (Local timestamp is newer?) then (yes)
+    if (Online identity already exists in DB?) then (yes)
+      :Keep local file;\nno replacement queued;
+      stop
+    else (no)
+      if (Local content already matches online hash?) then (yes)
+        :Correct local timestamp to authoritative online timestamp;
+        :Upsert online item in DB;
+        stop
+      else (no)
+        :Content differs; replacement decision is deferred\nto transactional download commit;
+        note right
+          Local data is NOT destroyed here. If online content
+          must ultimately replace this pathname, the download
+          commit boundary re-evaluates the canonical file and
+          creates safeBackup when preservation is required.
+        end note
+      endif
+    endif
+  else (no)
+    if (Online timestamp is newer?) then (yes)
+      if (Local content matches online hash?) then (yes)
+        :Correct local timestamp;
+        :Upsert online item in DB;
+        stop
+      else (no)
+        :Different content; queue authoritative online replacement;
+        note right
+          Replacement is transactional. Unique local content
+          is preserved before the staged online file can become
+          the canonical local file.
+        end note
+      endif
+    else (timestamps equal)
+      if (Content hash matches?) then (yes)
+        :Upsert online item in DB;
+        stop
+      else (no)
+        :Equal timestamp does not imply equal content;\nqueue authoritative online replacement;
+        note right
+          The download transaction owns any later safeBackup
+          requirement; this function does not destructively
+          rename or overwrite the existing local file.
+        end note
+      endif
+    endif
+  endif
+else (no)
+  :No local object occupies target path;
+endif
+
+switch (Online item type)
+case (file)
+  :Queue file JSON for download;
+case (directory)
+  :Create local directory and persist metadata;
+case (remote directory)
+  :Create local shared-folder directory / ties;
+case (remote file)
+  :Queue file JSON for download;
+case (root / unknown / none)
+  :No local file action here;
+endswitch
+
+stop
+@enduml

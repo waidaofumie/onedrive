@@ -1,0 +1,115 @@
+@startuml
+title OneDrive Client for Linux - Functional Code Component Relationships
+
+skinparam componentStyle rectangle
+
+package "Application orchestration" {
+  component "main.d\n(main)" as main
+  component "config.d\n(config)" as config
+  component "log.d\n(log)" as log
+  component "time.d\n(time)" as time
+}
+
+package "Synchronisation and local state" {
+  component "sync.d\n(syncEngine)" as sync
+  component "monitor.d\n(monitor)" as monitor
+  component "clientSideFiltering.d\n(clientSideFiltering)" as filter
+  component "itemdb.d\n(itemdb)" as itemdb
+  component "sqlite.d\n(sqlite)" as sqlite
+  component "xattr.d\n(xattr)" as xattr
+  database "items.sqlite3" as db
+}
+
+package "Microsoft / network integration" {
+  component "onedrive.d\n(onedrive)" as onedrive
+  component "curlEngine.d\n(curlEngine)" as curl
+  component "localAuth.d\n(localAuth)" as localAuth
+  component "webhook.d\n(webhook)" as webhook
+  component "socketio.d\n(socketio)" as socketio
+  component "curlWebsockets.d\n(curlWebsockets)" as curlws
+  component "intune.d\n(intune)" as intune
+}
+
+package "Shared utilities" {
+  component "util.d\n(util)" as util
+  component "qxor.d\n(qxor)" as qxor
+}
+
+main --> config
+main --> log
+main --> time
+main --> onedrive
+main --> sync
+main --> itemdb
+main --> filter
+main --> monitor
+main --> webhook
+main --> socketio
+main --> intune
+main --> curl
+main --> util
+
+config --> log
+config --> util
+
+time --> config
+time --> log
+time --> util
+
+filter --> config
+filter --> log
+filter --> util
+
+sync --> config
+sync --> log
+sync --> util
+sync --> onedrive
+sync --> itemdb
+sync --> filter
+sync --> xattr
+
+monitor --> config
+monitor --> log
+monitor --> util
+monitor --> filter
+main .> monitor : collects inotify events
+main .> sync : applies local/remote changes
+
+itemdb --> sqlite
+itemdb --> util
+itemdb --> log
+sqlite --> log
+sqlite --> util
+sqlite --> db : reads / writes
+
+onedrive --> config
+onedrive --> log
+onedrive --> util
+onedrive --> curl
+onedrive --> localAuth
+onedrive --> intune
+
+localAuth --> config
+localAuth --> log
+
+webhook --> config
+webhook --> onedrive
+webhook --> log
+webhook --> util
+
+socketio --> config
+socketio --> log
+socketio --> util
+socketio --> curlws
+curlws --> log
+
+intune --> log
+
+curl --> log
+curl --> util
+
+util --> log
+util --> config
+util --> qxor
+util --> curl
+@enduml

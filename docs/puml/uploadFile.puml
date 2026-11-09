@@ -1,0 +1,122 @@
+@startuml
+title New Local File Upload Flow
+start
+
+note right
+  This path handles local files that are not yet tracked as an
+  existing canonical DriveItem. A same-name online object is not
+  automatically safe to overwrite; it becomes a reconciliation case.
+end note
+
+if (Path is protected by .nosync?) then (yes)
+  :Skip upload;
+  stop
+endif
+
+:Resolve parent DB identity / target drive;
+if (Parent cannot be resolved?) then (yes)
+  :Record upload failure;
+  stop
+endif
+
+if (Local file still exists and is readable?) then (no)
+  :Treat disappeared file as no-op,\nor unreadable file as failure;
+  stop
+endif
+
+:Read file size;
+if (Exceeds Microsoft maximum upload size?) then (yes)
+  :Record upload failure;
+  stop
+endif
+
+:Check cached / available OneDrive quota where available;
+if (Known insufficient online space?) then (yes)
+  :Record upload failure;
+  stop
+endif
+
+:Query target name online;
+if (Same-name online item exists?) then (yes)
+  :Validate case-sensitive/POSIX naming compatibility;
+  if (Local content matches online item?) then (yes)
+    :Zero data traversal;
+    :Save online identity / metadata in DB;
+    note right
+      Matching bytes can be bound to the existing online identity;
+      there is no reason to upload or create a conflict copy.
+    end note
+    stop
+  else (no)
+    :Treat collision as existing-file reconciliation;
+    :Temporarily establish online identity in DB;
+    :Evaluate local versus current online state;
+    if (Local version is selected for modified upload?) then (yes)
+      :Route to modified-file upload path;
+    else (no / conflict)
+      :Create verified independent safeBackup copy;
+      note right
+        LOCAL DATA LOSS PREVENTION
+
+        The local candidate must not be discarded merely because the
+        same pathname already exists online. Preserve the local bytes
+        before resolving which object remains canonical.
+      end note
+      :Upload safeBackup as a new file;
+      :Remove temporary canonical DB association;
+      if (~--upload-only?) then (yes)
+        :Retain canonical local file for future reconciliation;
+        note right
+          ~--upload-only cannot apply the online version locally, so
+          the canonical local path is retained after preservation.
+        end note
+      else (no)
+        :Download authoritative online file transactionally;
+        note right
+          In bidirectional operation the online canonical can now be
+          applied locally because the differing local bytes have been
+          preserved independently.
+        end note
+      endif
+    endif
+    stop
+  endif
+else (404 / no existing item)
+  :Proceed with actual new-file upload;
+endif
+
+if (File is zero bytes?) then (yes)
+  :Use simple upload;
+else (no)
+  if (force_session_upload or\n~--upload-only + ~--local-first?) then (yes)
+    :Use upload session;
+  else (no)
+    if (File <= session threshold?) then (yes)
+      :Use simple upload;
+    else (no)
+      :Use resumable upload session;
+    endif
+  endif
+endif
+
+:Validate upload response and content integrity;
+if (Simple upload succeeded and integrity passed?) then (yes)
+  :Save Microsoft-returned metadata;
+  if (Not ~--upload-only?) then (yes)
+    :Apply Microsoft-returned timestamp locally;
+  endif
+else (session / enrichment handling)
+  :Apply session-upload and account-specific\npost-upload reconciliation rules;
+  if (SharePoint enrichment changed uploaded content?) then (yes)
+    if (Bidirectional mode and no new-version override?) then (yes)
+      :Download Microsoft-returned enriched file transactionally;
+    else (no)
+      :Apply configured metadata/version reconciliation;
+    endif
+  else (no)
+    :Save successful upload state;
+  endif
+endif
+
+stop
+@enduml

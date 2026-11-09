@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from framework.context import E2EContext
+from framework.manifest import build_manifest, write_manifest
+from framework.pdf import create_random_pdf_pair, validate_pdf_pair, large_pdf_relative, pdf_pair_all_files
+from framework.image import create_random_image_set, validate_image_set, image_set_relatives, image_set_any_exists, image_set_all_files
+from framework.result import TestResult
+from framework.xlsx import REVISION_0, create_random_xlsx_pair, validate_xlsx_pair, large_xlsx_relative
+from framework.utils import command_to_string, reset_directory, run_command, write_text_file
+from testcases.monitor_case_base import MonitorModeTestCaseBase
+
+
+class TestCase0046MonitorModeLocalDirectoryRenamePropagation(MonitorModeTestCaseBase):
+    case_id = "0046"
+    name = "monitor mode local directory rename propagation"
+    description = "Rename a populated local directory containing passive TXT plus real XLSX/PDF and PNG/JPEG files while --monitor is active and validate the final remote state"
+
+    XLSX_PAYLOAD_ROWS = 32
+
+    def run(self, context: E2EContext) -> TestResult:
+        layout = self.prepare_case_layout(
+            context,
+            case_dir_name="tc0046",
+            ensure_refresh_token=True,
+        )
+        case_work_dir = layout.work_dir
+        case_log_dir = layout.log_dir
+        state_dir = layout.state_dir
+
+        sync_root = case_work_dir / "syncroot"
+        verify_root = case_work_dir / "verifyroot"
+        conf_main = case_work_dir / "conf-main"
+        conf_verify = case_work_dir / "conf-verify"
+        app_log_dir = case_log_dir / "app-logs"
+
+        root_name = f"ZZ_E2E_TC0046_{context.run_id}_{os.getpid()}"
+        old_dir_relative = f"{root_name}/original-dir"
+        new_dir_relative = f"{root_name}/renamed-dir"
+        old_file_relative = f"{old_dir_relative}/inside.xlsx"
+        new_file_relative = f"{new_dir_relative}/inside.xlsx"
+        old_pdf_relative = f"{old_dir_relative}/inside.pdf"
+        new_pdf_relative = f"{new_dir_relative}/inside.pdf"
+        old_image_relative = f"{old_dir_relative}/inside.png"
+        new_image_relative = f"{new_dir_relative}/inside.png"
+        old_text_relative = f"{old_dir_relative}/inside.txt"
+        new_text_relative = f"{new_dir_relative}/inside.txt"
+
+        old_dir_local_path = sync_root / old_dir_relative
+        new_dir_local_path = sync_root / new_dir_relative
+        old_file_local_path = sync_root / old_file_relative
+        old_pdf_local_path = sync_root / old_pdf_relative
+        old_text_local_path = sync_root / old_text_relative
+        old_dir_verify_path = verify_root / old_dir_relative
+        new_dir_verify_path = verify_root / new_dir_relative
+        old_file_verify_path = verify_root / old_file_relative
+        new_file_verify_path = verify_root / new_file_relative
+        old_pdf_verify_path = verify_root / old_pdf_relative
+        new_pdf_verify_path = verify_root / new_pdf_relative
+        old_image_local_path = sync_root / old_image_relative
+        new_image_local_path = sync_root / new_image_relative
+        old_image_verify_path = verify_root / old_image_relative
+        new_image_verify_path = verify_root / new_image_relative
+        old_text_verify_path = verify_root / old_text_relative
+        new_text_verify_path = verify_root / new_text_relative
+
+        text_content = "TC0046 passive TXT content must survive the directory rename unchanged.\n"
+        xlsx_seed = f"{context.run_id}:{context.e2e_target}:TC0046:{os.getpid()}"
+        pdf_seed = f"{xlsx_seed}:pdf"
+        image_seed = f"{xlsx_seed}:image"
+
+        context.prepare_minimal_config_dir(conf_main, self._build_config_text(sync_root, app_log_dir))
+        context.prepare_minimal_config_dir(
+            conf_verify,
+            (
+                "# tc0046 verify\n"
+                f'sync_dir = "{verify_root}"\n'
+                'bypass_data_preservation = "true"\n'
+            ),
+        )
+
+        generated = create_random_xlsx_pair(
+            old_file_local_path,
+            xlsx_seed,
+            revision=REVISION_0,
+            payload_rows=self.XLSX_PAYLOAD_ROWS,
+            title="TC0046 monitor local directory rename workbook",
+        )
+        generated_pdf = create_random_pdf_pair(
+            old_pdf_local_path,
+            pdf_seed,
+            revision=REVISION_0,
+            title="TC0046 monitor local directory rename PDF",
+        )
+        generated_images = create_random_image_set(old_image_local_path, image_seed, revision=REVISION_0, title="TC0046 monitor directory rename images")
+        write_text_file(old_text_local_path, text_content)
+
+        seed_stdout = case_log_dir / "seed_stdout.log"
+        seed_stderr = case_log_dir / "seed_stderr.log"
+        monitor_stdout = case_log_dir / "monitor_stdout.log"
+        monitor_stderr = case_log_dir / "monitor_stderr.log"
+        verify_stdout = case_log_dir / "verify_stdout.log"
+        verify_stderr = case_log_dir / "verify_stderr.log"
+        verify_manifest_file = state_dir / "verify_manifest.txt"
+        metadata_file = state_dir / "metadata.txt"
+
+        artifacts = [str(seed_stdout), str(seed_stderr), str(monitor_stdout), str(monitor_stderr), str(verify_stdout), str(verify_stderr), str(verify_manifest_file), str(metadata_file)]
+        details = {"root_name": root_name, "old_dir_relative": old_dir_relative, "new_dir_relative": new_dir_relative, "old_file_relative": old_file_relative, "new_file_relative": new_file_relative, "old_pdf_relative": old_pdf_relative, "new_pdf_relative": new_pdf_relative, "old_text_relative": old_text_relative, "new_text_relative": new_text_relative, "xlsx_seed": xlsx_seed, "pdf_seed": pdf_seed, "image_seed": image_seed, "payload_rows": self.XLSX_PAYLOAD_ROWS, "generated_image_sizes": {k: int(v) for k, v in generated_images.items() if k.endswith("_size_bytes")}, "generated_size": int(generated["size_bytes"]), "generated_pdf_size": int(generated_pdf["size_bytes"]), "generated_large_pdf_size": int(generated_pdf["large_size_bytes"])}
+
+        seed_command = [context.onedrive_bin, "--display-running-config", "--sync", "--verbose", "--single-directory", root_name, "--syncdir", str(sync_root), "--confdir", str(conf_main)]
+        context.log(f"Executing Test Case {self.case_id} seed: {command_to_string(seed_command)}")
+        seed_result = run_command(seed_command, cwd=context.repo_root)
+        write_text_file(seed_stdout, seed_result.stdout)
+        write_text_file(seed_stderr, seed_result.stderr)
+        details["seed_returncode"] = seed_result.returncode
+        if seed_result.returncode != 0:
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(self.case_id, self.name, f"Seed phase failed with status {seed_result.returncode}", artifacts, details)
+
+        settled_validation_error = validate_xlsx_pair(old_file_local_path, REVISION_0)
+        settled_text_content = old_text_local_path.read_text(encoding="utf-8") if old_text_local_path.is_file() else ""
+        details["settled_validation_error"] = settled_validation_error
+        settled_pdf_validation_error = validate_pdf_pair(old_pdf_local_path, REVISION_0)
+        settled_image_validation_error = validate_image_set(old_image_local_path, REVISION_0)
+        details["settled_pdf_validation_error"] = settled_pdf_validation_error
+        details["settled_image_validation_error"] = settled_image_validation_error
+        details["settled_text_content"] = settled_text_content
+        if settled_validation_error:
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(self.case_id, self.name, f"Seeded XLSX was invalid after initial sync: {settled_validation_error}", artifacts, details)
+        if settled_image_validation_error:
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(self.case_id, self.name, f"Seeded image set was invalid after initial sync: {settled_image_validation_error}", artifacts, details)
+        if settled_pdf_validation_error:
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(self.case_id, self.name, f"Seeded PDF was invalid after initial sync: {settled_pdf_validation_error}", artifacts, details)
+        if settled_text_content != text_content:
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(self.case_id, self.name, "Seeded passive TXT content changed during initial sync", artifacts, details)
+
+        monitor_command = [context.onedrive_bin, "--display-running-config", "--monitor", "--verbose", "--single-directory", root_name, "--syncdir", str(sync_root), "--confdir", str(conf_main)]
+        context.log(f"Executing Test Case {self.case_id} monitor: {command_to_string(monitor_command)}")
+        process, initial_sync_complete = self._launch_monitor_process(context, monitor_command, monitor_stdout, monitor_stderr)
+        try:
+            details["initial_sync_complete"] = initial_sync_complete
+            if not initial_sync_complete:
+                self._write_metadata(metadata_file, details)
+                return self.fail_result(self.case_id, self.name, "Monitor mode did not complete the initial sync within the expected time", artifacts, details)
+
+            mutation_log_start_offset = self._prepare_monitor_for_local_mutation(process, monitor_stdout, details)
+
+            old_dir_local_path.rename(new_dir_local_path)
+            old_image_relatives = image_set_relatives(old_image_relative)
+            new_image_relatives = image_set_relatives(new_image_relative)
+            groups = [
+                [f"[M] Local item moved: {old_dir_relative} -> {new_dir_relative}", f"Moving {old_dir_relative} to {new_dir_relative}"],
+                [
+                    f"Deleting item from Microsoft OneDrive: {old_file_relative}",
+                    f"Uploading new file: {new_file_relative} ... done",
+                    f"Deleting item from Microsoft OneDrive: {large_xlsx_relative(old_file_relative)}",
+                    f"Uploading new file: {large_xlsx_relative(new_file_relative)} ... done",
+                    f"Deleting item from Microsoft OneDrive: {old_pdf_relative}",
+                    f"Uploading new file: {new_pdf_relative} ... done",
+                    f"Deleting item from Microsoft OneDrive: {large_pdf_relative(old_pdf_relative)}",
+                    f"Uploading new file: {large_pdf_relative(new_pdf_relative)} ... done",
+                    *[f"Deleting item from Microsoft OneDrive: {old_image_relatives[label]}" for label in old_image_relatives],
+                    *[f"Uploading new file: {new_image_relatives[label]} ... done" for label in new_image_relatives],
+                ],
+            ]
+            mutation_processed, matched_group, post_mutation_log_segment = self._wait_for_any_stdout_growth_pattern_group(
+                monitor_stdout,
+                start_offset=mutation_log_start_offset,
+                alternative_pattern_groups=groups,
+                timeout_seconds=180,
+            )
+            post_mutation_sync_complete = self.SYNC_COMPLETE_PATTERN in post_mutation_log_segment
+            details["post_mutation_sync_complete"] = post_mutation_sync_complete
+            details["mutation_processed"] = mutation_processed
+            details["matched_pattern_group_index"] = matched_group
+            details["post_mutation_log_segment_length"] = len(post_mutation_log_segment)
+            details["mutation_pattern_groups"] = groups
+        finally:
+            self._shutdown_monitor_process(process, details)
+
+        # A correct final remote manifest alone cannot prove that the inotify
+        # monitor handled the mutation. Require the post-mutation event itself.
+        if not details.get("mutation_processed", False):
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(
+                self.case_id, self.name,
+                "Monitor mutation event was not observed; filesystem/remote state alone is insufficient",
+                artifacts, details,
+            )
+
+        verify_command = [context.onedrive_bin, "--display-running-config", "--sync", "--download-only", "--verbose", "--resync", "--resync-auth", "--single-directory", root_name, "--syncdir", str(verify_root), "--confdir", str(conf_verify)]
+        context.log(f"Executing Test Case {self.case_id} verify: {command_to_string(verify_command)}")
+        verify_result = self._run_verify_command(context, verify_command, verify_stdout, verify_stderr)
+        details["verify_returncode"] = verify_result.returncode
+        verify_manifest = build_manifest(verify_root)
+        write_manifest(verify_manifest_file, verify_manifest)
+        details["verify_old_dir_exists"] = old_dir_verify_path.exists()
+        details["verify_new_dir_exists"] = new_dir_verify_path.is_dir()
+        details["verify_old_file_exists"] = old_file_verify_path.exists()
+        details["verify_new_file_exists"] = new_file_verify_path.is_file()
+        details["verify_old_pdf_exists"] = old_pdf_verify_path.exists()
+        details["verify_new_pdf_exists"] = pdf_pair_all_files(new_pdf_verify_path)
+        details["verify_old_image_exists"] = image_set_any_exists(old_image_verify_path)
+        details["verify_new_image_exists"] = image_set_all_files(new_image_verify_path)
+        details["verify_old_text_exists"] = old_text_verify_path.exists()
+        details["verify_new_text_exists"] = new_text_verify_path.is_file()
+        verify_text_content = new_text_verify_path.read_text(encoding="utf-8") if new_text_verify_path.is_file() else ""
+        details["verify_text_content"] = verify_text_content
+        verify_validation_error = (
+            validate_xlsx_pair(new_file_verify_path, REVISION_0)
+            if new_file_verify_path.is_file()
+            else "Verification XLSX is missing"
+        )
+        details["verify_validation_error"] = verify_validation_error
+        verify_pdf_validation_error = (validate_pdf_pair(new_pdf_verify_path, REVISION_0) if pdf_pair_all_files(new_pdf_verify_path) else "Verification PDF is missing")
+        details["verify_pdf_validation_error"] = verify_pdf_validation_error
+        verify_image_validation_error = validate_image_set(new_image_verify_path, REVISION_0) if image_set_all_files(new_image_verify_path) else "Verification image set is missing"
+        details["verify_image_validation_error"] = verify_image_validation_error
+        self._write_metadata(metadata_file, details)
+
+        if verify_result.returncode != 0:
+            return self.fail_result(self.case_id, self.name, f"Remote verification failed with status {verify_result.returncode}", artifacts, details)
+        if old_dir_verify_path.exists() or old_file_verify_path.exists() or old_pdf_verify_path.exists() or image_set_any_exists(old_image_verify_path) or old_text_verify_path.exists():
+            return self.fail_result(self.case_id, self.name, f"Remote verification still contains old directory path: {old_dir_relative}", artifacts, details)
+        if not new_dir_verify_path.is_dir() or not new_file_verify_path.is_file() or not pdf_pair_all_files(new_pdf_verify_path) or not image_set_all_files(new_image_verify_path) or not new_text_verify_path.is_file():
+            return self.fail_result(self.case_id, self.name, f"Remote verification is missing renamed directory content at: {new_dir_relative}", artifacts, details)
+        if verify_text_content != text_content:
+            return self.fail_result(self.case_id, self.name, "Renamed directory passive TXT content did not match expected content", artifacts, details)
+        if verify_validation_error:
+            return self.fail_result(self.case_id, self.name, f"Remote verification returned an invalid or stale XLSX workbook: {verify_validation_error}", artifacts, details)
+        if verify_image_validation_error:
+            return self.fail_result(self.case_id, self.name, f"Remote verification returned an invalid or stale image set: {verify_image_validation_error}", artifacts, details)
+        if verify_pdf_validation_error:
+            return self.fail_result(self.case_id, self.name, f"Remote verification returned an invalid or stale PDF: {verify_pdf_validation_error}", artifacts, details)
+        return self.pass_result(self.case_id, self.name, artifacts, details)

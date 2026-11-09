@@ -1,0 +1,47 @@
+@startuml
+title Webhook Remote-Change Notification Architecture
+
+skinparam SequenceBoxBackgroundColor<<Internal>> AliceBlue
+
+box "Linux host"<<Internal>>
+  participant "OneDrive Client\nWebhook module" as Client
+  participant "Reverse proxy\n(e.g. nginx)" as Proxy
+end box
+participant "Firewall / Router" as Firewall
+participant "Microsoft Graph API" as Graph
+
+== Listener and subscription ==
+Client -> Client: Listen on configured webhook_listening_host / port
+Client -> Graph: Create subscription with webhook_public_url
+Graph -> Firewall: Validation request containing validationToken
+Firewall -> Proxy: Forward HTTPS request
+Proxy -> Client: Proxy validation request
+Client --> Proxy: Echo validationToken
+Proxy --> Graph: HTTPS validation response
+Graph --> Client: Subscription creation response\n(id + expiration)
+
+== Change notification ==
+Graph -> Firewall: HTTPS change notification
+Firewall -> Proxy: Forward HTTPS request
+Proxy -> Client: Proxy notification
+Client -> Client: Validate / record notification signal
+Client --> Proxy: HTTP acknowledgement
+Proxy --> Graph: HTTPS acknowledgement
+Client -> Client: Wake monitor loop / trigger online reconciliation
+
+== Subscription lifecycle ==
+loop Before expiry / after recoverable failure
+  Client -> Graph: Renew existing subscription
+  alt Subscription no longer exists
+    Graph --> Client: Not found
+    Client -> Graph: Recreate subscription
+    Graph --> Client: New subscription metadata
+  else Renewal succeeds
+    Graph --> Client: Updated expiration
+  end
+end
+
+opt Client shutdown
+  Client -> Graph: Delete active subscription
+end
+@enduml

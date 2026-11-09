@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _case_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("tc") and text[2:].isdigit():
+        return text[2:].zfill(4)
+    if text.startswith("bsftc") and text[5:].isdigit():
+        return f"bsftc{text[5:].zfill(4)}"
+    if text.startswith("sfptc") and text[5:].isdigit():
+        return f"sfptc{text[5:].zfill(4)}"
+    if text.startswith("bsf") and text[3:].isdigit():
+        return f"bsftc{text[3:].zfill(4)}"
+    if text.startswith("sfp") and text[3:].isdigit():
+        return f"sfptc{text[3:].zfill(4)}"
+    if text.isdigit() and len(text) <= 4:
+        return text.zfill(4)
+    return text
+
+
+def _case_map(results: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not results:
+        return {}
+    mapped: dict[str, dict[str, Any]] = {}
+    for case in results.get("cases", []) or []:
+        key = _case_key(case.get("id"))
+        if key:
+            mapped[key] = case
+    return mapped
+
+
+def _results_coverage_error(results: dict[str, Any], *, label: str) -> str | None:
+    """Reject incomplete case execution before evaluating pass/recovery status.
+
+    A missing case is not a PASS. The planned case list is recorded by each
+    suite runner before it starts invoking cases; gate success requires one
+    result for every planned case, with no duplicate or unplanned PASS entry.
+    """
+    raw_expected = results.get("executed_case_ids")
+    raw_cases = results.get("cases")
+    if not isinstance(raw_expected, list) or not raw_expected:
+        return f"{label}: no executed_case_ids recorded"
+    if not isinstance(raw_cases, list) or not raw_cases:
+        return f"{label}: no case results recorded"
+
+    expected = [_case_key(value) for value in raw_expected]
+    if any(not case_id for case_id in expected) or len(expected) != len(set(expected)):
+        return f"{label}: invalid or duplicate planned case IDs"
+
+    observed = [_case_key(case.get("id")) for case in raw_cases if isinstance(case, dict)]
+    if len(observed) != len(raw_cases) or any(not case_id for case_id in observed):
+        return f"{label}: invalid case result entries"
+    if len(observed) != len(set(observed)):
+        return f"{label}: duplicate case result IDs"
+
+    missing = sorted(set(expected) - set(observed))
+    # 0000 (suite setup) and 9999 (final cleanup) are auxiliary failure-only
+    # records. They must never contribute to the executed test count.
+    unexpected = sorted(set(observed) - set(expected) - {"0000", "9999"})
+    if missing or unexpected:
+        return (f"{label}: incomplete case coverage: "
+                f"missing={missing}, unexpected={unexpected}")
+    for auxiliary in set(observed) & {"0000", "9999"}:
+        case = next(item for item in raw_cases if _case_key(item.get("id")) == auxiliary)
+        if str(case.get("status", "")).lower() == "pass":
+            return f"{label}: auxiliary result {auxiliary} must not be a PASS"
+    return None
+
+
+def _failed_cases(results: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    return {
+        key: case
+        for key, case in _case_map(results).items()
+        if str(case.get("status", "")).lower() != "pass"
+    }
+
+
+def _is_non_rerunnable_failure(case: dict[str, Any]) -> bool:
+    details = case.get("details") or {}
+    return _case_key(case.get("id")) == "0000" or details.get("non_rerunnable") is True
+
+
+def _failure_reasons(cases: dict[str, dict[str, Any]]) -> list[str]:
+    reasons: list[str] = []
+    for case_id, case in sorted(cases.items()):
+        reason = str(case.get("reason") or "").strip()
+        if reason:
+            reasons.append(f"{case_id}: {reason}")
+    return reasons
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+
+
+def _build_effective_results(
+    primary: dict[str, Any],
+    debug_cases: dict[str, dict[str, Any]],
+    recovered_case_ids: set[str],
+) -> dict[str, Any]:
+    effective = copy.deepcopy(primary)
+    effective_cases: list[dict[str, Any]] = []
+
+    for primary_case in primary.get("cases", []) or []:
+        case_id = _case_key(primary_case.get("id"))
+        if case_id in recovered_case_ids:
+            effective_cases.append(copy.deepcopy(debug_cases[case_id]))
+        else:
+            effective_cases.append(copy.deepcopy(primary_case))
+
+    effective["cases"] = effective_cases
+    return effective
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Evaluate final E2E gate status after optional debug rerun")
+    parser.add_argument("--primary-results", default="ci/e2e/out/results.json")
+    parser.add_argument("--debug-results", default="ci/e2e/out/debug-rerun/results.json")
+    parser.add_argument("--gate-file", default="ci/e2e/out/gate.json")
+    parser.add_argument("--cleanup-results", help="Required post-debug cleanup result JSON")
+    args = parser.parse_args()
+
+    primary_path = Path(args.primary_results)
+    debug_path = Path(args.debug_results)
+    gate_path = Path(args.gate_file)
+
+    if args.cleanup_results:
+        cleanup_path = Path(args.cleanup_results)
+        try:
+            cleanup = _load_json(cleanup_path)
+        except (ValueError, OSError) as exc:
+            cleanup = {"status": "fail", "reason": f"Invalid cleanup result: {exc}"}
+        if not cleanup or cleanup.get("status") != "pass":
+            reason = (cleanup or {}).get("reason") or "Missing post-debug cleanup result"
+            # Cleanup failure is a hard gate failure, but it must not erase the
+            # primary/debug evidence needed to diagnose the underlying defects.
+            try:
+                primary_for_report = _load_json(primary_path)
+                debug_for_report = _load_json(debug_path)
+            except (ValueError, OSError):
+                primary_for_report = None
+                debug_for_report = None
+            primary_failures = _failed_cases(primary_for_report)
+            debug_failures = _failed_cases(debug_for_report)
+            debug_cases = _case_map(debug_for_report)
+            # Preserve a genuine debug recovery result even if the separate,
+            # mandatory cleanup fails. Invalid/incomplete evidence must not
+            # be counted as recovered.
+            valid_report = (
+                primary_for_report is not None and debug_for_report is not None
+                and _results_coverage_error(primary_for_report, label="Primary results") is None
+                and _results_coverage_error(debug_for_report, label="Debug rerun results") is None
+                and not (set(debug_cases) - set(primary_failures))
+            )
+            recovered = sorted(case_id for case_id in primary_failures
+                               if valid_report and case_id in debug_cases and case_id not in debug_failures)
+            unrecovered = sorted(set(primary_failures) - set(recovered))
+            effective_results_path = primary_path
+            if recovered:
+                effective_results_path = gate_path.with_name("effective-results.json")
+                _write_json(effective_results_path, _build_effective_results(
+                    primary_for_report, debug_cases, set(recovered)
+                ))
+            payload = {
+                "conclusion": "failure",
+                "recovered_by_debug_rerun": False,
+                "reason": f"Mandatory post-debug cleanup failed: {reason}",
+                "primary_results": str(primary_path),
+                "debug_results": str(debug_path),
+                "cleanup_results": str(cleanup_path),
+                "effective_results": str(effective_results_path),
+                "primary_failed_case_ids": sorted(primary_failures),
+                "debug_failed_case_ids": sorted(debug_failures),
+                "recovered_case_ids": recovered,
+                "unrecovered_case_ids": unrecovered,
+            }
+            _write_json(gate_path, payload)
+            print(payload["reason"])
+            return 1
+
+    primary = _load_json(primary_path)
+    debug = _load_json(debug_path)
+
+    if primary is None:
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": f"Primary results file not found: {primary_path}",
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": None,
+            "primary_failed_case_ids": [],
+            "debug_failed_case_ids": [],
+            "recovered_case_ids": [],
+            "unrecovered_case_ids": [],
+        }
+        _write_json(gate_path, payload)
+        print(payload["reason"])
+        return 1
+
+    coverage_error = _results_coverage_error(primary, label="Primary results")
+    if coverage_error:
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": coverage_error,
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(primary_path),
+            "primary_failed_case_ids": [], "debug_failed_case_ids": [],
+            "recovered_case_ids": [], "unrecovered_case_ids": [],
+        }
+        _write_json(gate_path, payload)
+        print(coverage_error)
+        return 1
+
+    primary_failures = _failed_cases(primary)
+    if not primary_failures:
+        payload = {
+            "conclusion": "success",
+            "recovered_by_debug_rerun": False,
+            "reason": "Primary E2E run passed without debug recovery",
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(primary_path),
+            "primary_failed_case_ids": [],
+            "debug_failed_case_ids": [],
+            "recovered_case_ids": [],
+            "unrecovered_case_ids": [],
+        }
+        _write_json(gate_path, payload)
+        print(payload["reason"])
+        return 0
+
+    non_rerunnable_failures = {
+        case_id: case
+        for case_id, case in primary_failures.items()
+        if _is_non_rerunnable_failure(case)
+    }
+    if non_rerunnable_failures:
+        reason_lines = _failure_reasons(non_rerunnable_failures)
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": "Primary E2E run failed during a non-rerunnable harness stage",
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(primary_path),
+            "primary_failed_case_ids": sorted(primary_failures),
+            "debug_failed_case_ids": [],
+            "recovered_case_ids": [],
+            "unrecovered_case_ids": sorted(primary_failures),
+            "non_rerunnable_case_ids": sorted(non_rerunnable_failures),
+            "non_rerunnable_reasons": reason_lines,
+        }
+        _write_json(gate_path, payload)
+        print(payload["reason"])
+        for line in reason_lines:
+            print(line)
+        return 1
+
+    if debug is None:
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": f"Primary E2E run failed and debug rerun results file was not found: {debug_path}",
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(primary_path),
+            "primary_failed_case_ids": sorted(primary_failures),
+            "debug_failed_case_ids": [],
+            "recovered_case_ids": [],
+            "unrecovered_case_ids": sorted(primary_failures),
+        }
+        _write_json(gate_path, payload)
+        print(payload["reason"])
+        return 1
+
+    coverage_error = _results_coverage_error(debug, label="Debug rerun results")
+    if coverage_error:
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": coverage_error,
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(primary_path),
+            "primary_failed_case_ids": sorted(primary_failures),
+            "debug_failed_case_ids": [], "recovered_case_ids": [],
+            "unrecovered_case_ids": sorted(primary_failures),
+        }
+        _write_json(gate_path, payload)
+        print(coverage_error)
+        return 1
+
+    debug_cases = _case_map(debug)
+    debug_failures = _failed_cases(debug)
+    unexpected_debug_cases = sorted(set(debug_cases) - set(primary_failures))
+    if unexpected_debug_cases:
+        reason = "Debug rerun included unexpected case results: " + ", ".join(unexpected_debug_cases)
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": reason,
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(primary_path),
+            "primary_failed_case_ids": sorted(primary_failures),
+            "debug_failed_case_ids": sorted(debug_failures),
+            "recovered_case_ids": [],
+            "unrecovered_case_ids": sorted(primary_failures),
+        }
+        _write_json(gate_path, payload)
+        print(reason)
+        return 1
+    unrecovered: list[str] = []
+    for case_id in sorted(primary_failures):
+        debug_case = debug_cases.get(case_id)
+        if not debug_case or str(debug_case.get("status", "")).lower() != "pass":
+            unrecovered.append(case_id)
+
+    recovered_case_ids = set(primary_failures) - set(unrecovered)
+    effective_results_path = primary_path
+
+    if recovered_case_ids:
+        effective_path = gate_path.with_name("effective-results.json")
+        effective_results = _build_effective_results(primary, debug_cases, recovered_case_ids)
+        _write_json(effective_path, effective_results)
+        effective_results_path = effective_path
+
+    if unrecovered:
+        payload = {
+            "conclusion": "failure",
+            "recovered_by_debug_rerun": False,
+            "reason": "Primary E2E run failed and one or more failed cases did not pass during debug rerun",
+            "primary_results": str(primary_path),
+            "debug_results": str(debug_path),
+            "effective_results": str(effective_results_path),
+            "primary_failed_case_ids": sorted(primary_failures),
+            "debug_failed_case_ids": sorted(debug_failures),
+            "recovered_case_ids": sorted(recovered_case_ids),
+            "unrecovered_case_ids": unrecovered,
+        }
+        _write_json(gate_path, payload)
+        print(payload["reason"])
+        if recovered_case_ids:
+            print("Recovered case ids:", ",".join(sorted(recovered_case_ids)))
+        print("Unrecovered case ids:", ",".join(unrecovered))
+        return 1
+
+    payload = {
+        "conclusion": "success",
+        "recovered_by_debug_rerun": True,
+        "reason": "Primary E2E run failed, but all failed cases passed during debug rerun",
+        "primary_results": str(primary_path),
+        "debug_results": str(debug_path),
+        "effective_results": str(effective_results_path),
+        "primary_failed_case_ids": sorted(primary_failures),
+        "debug_failed_case_ids": sorted(debug_failures),
+        "recovered_case_ids": sorted(recovered_case_ids),
+        "unrecovered_case_ids": [],
+    }
+    _write_json(gate_path, payload)
+    print(payload["reason"])
+    print("Recovered case ids:", ",".join(sorted(recovered_case_ids)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

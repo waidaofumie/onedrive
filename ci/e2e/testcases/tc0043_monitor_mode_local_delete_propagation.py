@@ -1,0 +1,405 @@
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+from testcases.monitor_case_base import MonitorModeTestCaseBase
+from framework.context import E2EContext
+from framework.manifest import build_manifest, write_manifest
+from framework.pdf import create_random_pdf_pair, validate_pdf_pair, unlink_pdf_pair, large_pdf_relative, pdf_pair_any_exists, pdf_pair_all_files
+from framework.image import create_random_image_set, validate_image_set, unlink_image_set, image_set_relatives, image_set_any_exists, image_set_all_files
+from framework.result import TestResult
+from framework.xlsx import REVISION_0, create_random_xlsx_pair, validate_xlsx_pair, unlink_xlsx_pair, large_xlsx_relative, xlsx_pair_any_exists, xlsx_pair_all_files
+from framework.utils import command_to_string, reset_directory, run_command, write_onedrive_config, write_text_file
+
+
+class TestCase0043MonitorModeLocalDeletePropagation(MonitorModeTestCaseBase):
+    case_id = "0043"
+    name = "monitor mode local delete propagation"
+    description = "Delete passive TXT plus real XLSX and PDF files under --monitor and validate all remote deletes occur as expected"
+
+    XLSX_PAYLOAD_ROWS = 32
+
+    def _write_metadata(self, metadata_file: Path, details: dict[str, object]) -> None:
+        write_text_file(
+            metadata_file,
+            "\n".join(f"{key}={value!r}" for key, value in sorted(details.items())) + "\n",
+        )
+
+    def _build_config_text(self, sync_dir: Path, app_log_dir: Path) -> str:
+        return (
+            "# tc0043 config\n"
+            f'sync_dir = "{sync_dir}"\n'
+            'bypass_data_preservation = "true"\n'
+            'enable_logging = "true"\n'
+            f'log_dir = "{app_log_dir}"\n'
+            'monitor_interval = "300"\n'
+            'monitor_fullscan_frequency = "0"\n'
+            'disable_websocket_support = "true"\n'
+        )
+
+    def _read_stdout(self, stdout_file: Path) -> str:
+        if not stdout_file.exists():
+            return ""
+        try:
+            return stdout_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _wait_for_initial_sync_complete(
+        self,
+        stdout_file: Path,
+        timeout_seconds: int = 120,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        deadline = time.time() + timeout_seconds
+        marker = "Sync with Microsoft OneDrive is complete"
+
+        while time.time() < deadline:
+            if marker in self._read_stdout(stdout_file):
+                return True
+            time.sleep(poll_interval)
+
+        return False
+
+    def _wait_for_monitor_patterns(
+        self,
+        stdout_file: Path,
+        required_patterns: list[str],
+        timeout_seconds: int = 120,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        deadline = time.time() + timeout_seconds
+
+        while time.time() < deadline:
+            content = self._read_stdout(stdout_file)
+            if all(self._monitor_output_contains(content, pattern) for pattern in required_patterns):
+                return True
+            time.sleep(poll_interval)
+
+        return False
+
+    def run(self, context: E2EContext) -> TestResult:
+        layout = self.prepare_case_layout(
+            context,
+            case_dir_name="tc0043",
+            ensure_refresh_token=True,
+        )
+        case_work_dir = layout.work_dir
+        case_log_dir = layout.log_dir
+        state_dir = layout.state_dir
+
+        sync_root = case_work_dir / "syncroot"
+        verify_root = case_work_dir / "verifyroot"
+        conf_main = case_work_dir / "conf-main"
+        conf_verify = case_work_dir / "conf-verify"
+        app_log_dir = case_log_dir / "app-logs"
+
+        root_name = f"ZZ_E2E_TC0043_{context.run_id}_{os.getpid()}"
+        keep_relative = f"{root_name}/anchor.txt"
+        delete_relative = f"{root_name}/delete-me.txt"
+        delete_xlsx_relative = f"{root_name}/delete-me.xlsx"
+        delete_pdf_relative = f"{root_name}/delete-me.pdf"
+        delete_image_relative = f"{root_name}/delete-me.png"
+
+        keep_local_path = sync_root / keep_relative
+        delete_local_path = sync_root / delete_relative
+        delete_xlsx_local_path = sync_root / delete_xlsx_relative
+        delete_pdf_local_path = sync_root / delete_pdf_relative
+        delete_image_local_path = sync_root / delete_image_relative
+
+        keep_verify_path = verify_root / keep_relative
+        delete_verify_path = verify_root / delete_relative
+        delete_xlsx_verify_path = verify_root / delete_xlsx_relative
+        delete_pdf_verify_path = verify_root / delete_pdf_relative
+        delete_image_verify_path = verify_root / delete_image_relative
+
+        keep_content = "TC0043 anchor\n"
+        delete_content = (
+            "TC0043 monitor mode local delete propagation\n"
+            "This file should be removed while --monitor is active.\n"
+        )
+        xlsx_seed = f"{context.run_id}:{context.e2e_target}:TC0043:{os.getpid()}"
+        pdf_seed = f"{xlsx_seed}:pdf"
+        image_seed = f"{xlsx_seed}:image"
+
+        context.bootstrap_config_dir(conf_main)
+        write_onedrive_config(conf_main / "config", self._build_config_text(sync_root, app_log_dir))
+
+        context.bootstrap_config_dir(conf_verify)
+        write_onedrive_config(
+            conf_verify / "config",
+            (
+                "# tc0043 verify\n"
+                f'sync_dir = "{verify_root}"\n'
+                'bypass_data_preservation = "true"\n'
+            ),
+        )
+        # Recheck *after* writing: bootstrap validation alone is insufficient
+        # because overwriting config can silently remove SharePoint drive_id.
+        context.validate_generated_config_dir(conf_main)
+        context.validate_generated_config_dir(conf_verify)
+
+        seed_stdout = case_log_dir / "seed_stdout.log"
+        seed_stderr = case_log_dir / "seed_stderr.log"
+        monitor_stdout = case_log_dir / "monitor_stdout.log"
+        monitor_stderr = case_log_dir / "monitor_stderr.log"
+        verify_stdout = case_log_dir / "verify_stdout.log"
+        verify_stderr = case_log_dir / "verify_stderr.log"
+        verify_manifest_file = state_dir / "verify_manifest.txt"
+        metadata_file = state_dir / "metadata.txt"
+
+        artifacts = [
+            str(seed_stdout),
+            str(seed_stderr),
+            str(monitor_stdout),
+            str(monitor_stderr),
+            str(verify_stdout),
+            str(verify_stderr),
+            str(verify_manifest_file),
+            str(metadata_file),
+        ]
+        if app_log_dir.exists():
+            artifacts.append(str(app_log_dir))
+
+        details: dict[str, object] = {
+            "root_name": root_name,
+            "keep_relative": keep_relative,
+            "delete_relative": delete_relative,
+            "delete_xlsx_relative": delete_xlsx_relative,
+            "delete_pdf_relative": delete_pdf_relative,
+            "delete_image_relative": delete_image_relative,
+            "xlsx_seed": xlsx_seed,
+            "pdf_seed": pdf_seed,
+            "image_seed": image_seed,
+            "xlsx_payload_rows": self.XLSX_PAYLOAD_ROWS,
+            "sync_root": str(sync_root),
+            "verify_root": str(verify_root),
+            "conf_main": str(conf_main),
+            "conf_verify": str(conf_verify),
+        }
+
+        write_text_file(keep_local_path, keep_content)
+        write_text_file(delete_local_path, delete_content)
+        generated = create_random_xlsx_pair(
+            delete_xlsx_local_path,
+            xlsx_seed,
+            revision=REVISION_0,
+            payload_rows=self.XLSX_PAYLOAD_ROWS,
+            title="TC0043 monitor local delete workbook",
+        )
+        details["generated_xlsx_size"] = int(generated["size_bytes"])
+        details["seed_xlsx_validation_error"] = validate_xlsx_pair(delete_xlsx_local_path, REVISION_0)
+        generated_pdf = create_random_pdf_pair(
+            delete_pdf_local_path,
+            pdf_seed,
+            revision=REVISION_0,
+            title="TC0043 monitor local delete PDF",
+        )
+        details["generated_pdf_size"] = int(generated_pdf["size_bytes"])
+        details["generated_large_pdf_size"] = int(generated_pdf["large_size_bytes"])
+        details["seed_pdf_validation_error"] = validate_pdf_pair(delete_pdf_local_path, REVISION_0)
+        generated_images = create_random_image_set(delete_image_local_path, image_seed, revision=REVISION_0, title="TC0043 monitor delete images")
+        details["generated_image_sizes"] = {k: int(v) for k, v in generated_images.items() if k.endswith("_size_bytes")}
+        details["seed_image_validation_error"] = validate_image_set(delete_image_local_path, REVISION_0)
+
+        seed_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--sync",
+            "--verbose",
+            "--single-directory",
+            root_name,
+            "--syncdir",
+            str(sync_root),
+            "--confdir",
+            str(conf_main),
+        ]
+        context.log(f"Executing Test Case {self.case_id} seed: {command_to_string(seed_command)}")
+        seed_result = run_command(seed_command, cwd=context.repo_root)
+        write_text_file(seed_stdout, seed_result.stdout)
+        write_text_file(seed_stderr, seed_result.stderr)
+        details["seed_returncode"] = seed_result.returncode
+
+        if seed_result.returncode != 0:
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Seed phase failed with status {seed_result.returncode}",
+                artifacts,
+                details,
+            )
+
+        monitor_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--monitor",
+            "--verbose",
+            "--single-directory",
+            root_name,
+            "--syncdir",
+            str(sync_root),
+            "--confdir",
+            str(conf_main),
+        ]
+        context.log(f"Executing Test Case {self.case_id} monitor: {command_to_string(monitor_command)}")
+
+        process, initial_sync_complete = self._launch_monitor_process(
+            context,
+            monitor_command,
+            monitor_stdout,
+            monitor_stderr,
+        )
+        try:
+            details["initial_sync_complete"] = initial_sync_complete
+
+            if not initial_sync_complete:
+                self._write_metadata(metadata_file, details)
+                return self.fail_result(
+                    self.case_id,
+                    self.name,
+                    "Monitor mode did not complete the initial sync within the expected time",
+                    artifacts,
+                    details,
+                )
+
+            mutation_log_start_offset = self._prepare_monitor_for_local_mutation(process, monitor_stdout, details)
+
+            if (not delete_local_path.is_file() or not xlsx_pair_all_files(delete_xlsx_local_path)
+                    or not pdf_pair_all_files(delete_pdf_local_path) or not image_set_all_files(delete_image_local_path)):
+                self._write_metadata(metadata_file, details)
+                return self.fail_result(self.case_id, self.name,
+                    "Initial monitor sync did not establish all deletion targets", artifacts, details)
+            context.log(f"Test Case {self.case_id}: deleting local files while monitor is running: {delete_relative}, {delete_xlsx_relative}, {delete_pdf_relative}, {delete_image_relative}")
+            if delete_local_path.exists():
+                delete_local_path.unlink()
+            if xlsx_pair_any_exists(delete_xlsx_local_path):
+                unlink_xlsx_pair(delete_xlsx_local_path)
+            if pdf_pair_any_exists(delete_pdf_local_path):
+                unlink_pdf_pair(delete_pdf_local_path)
+            if image_set_any_exists(delete_image_local_path):
+                unlink_image_set(delete_image_local_path)
+
+            details["local_deleted_exists_after_unlink"] = delete_local_path.exists()
+            details["local_deleted_xlsx_exists_after_unlink"] = xlsx_pair_any_exists(delete_xlsx_local_path)
+            details["local_deleted_pdf_exists_after_unlink"] = pdf_pair_any_exists(delete_pdf_local_path)
+            details["local_deleted_image_exists_after_unlink"] = image_set_any_exists(delete_image_local_path)
+
+            image_relatives = image_set_relatives(delete_image_relative)
+            required_patterns = [
+                f"Deleting item from Microsoft OneDrive: {delete_relative}",
+                f"Deleting item from Microsoft OneDrive: {delete_xlsx_relative}",
+                f"Deleting item from Microsoft OneDrive: {large_xlsx_relative(delete_xlsx_relative)}",
+                f"Deleting item from Microsoft OneDrive: {delete_pdf_relative}",
+                f"Deleting item from Microsoft OneDrive: {large_pdf_relative(delete_pdf_relative)}",
+                *[f"Deleting item from Microsoft OneDrive: {relative}" for relative in image_relatives.values()],
+            ]
+            mutation_processed, post_mutation_log_segment = self._wait_for_stdout_growth_patterns(
+                monitor_stdout,
+                start_offset=mutation_log_start_offset,
+                required_patterns=required_patterns,
+                timeout_seconds=180,
+            )
+            post_mutation_sync_complete = self.SYNC_COMPLETE_PATTERN in post_mutation_log_segment
+            details["post_mutation_sync_complete"] = post_mutation_sync_complete
+            details["mutation_processed"] = mutation_processed
+            details["post_mutation_log_segment_length"] = len(post_mutation_log_segment)
+            details["mutation_required_patterns"] = required_patterns
+        finally:
+            self._shutdown_monitor_process(process, details)
+
+        # A correct final remote manifest alone cannot prove that the inotify
+        # monitor handled the mutation. Require the post-mutation event itself.
+        if not details.get("mutation_processed", False):
+            self._write_metadata(metadata_file, details)
+            return self.fail_result(
+                self.case_id, self.name,
+                "Monitor mutation event was not observed; filesystem/remote state alone is insufficient",
+                artifacts, details,
+            )
+
+        verify_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--sync",
+            "--download-only",
+            "--verbose",
+            "--resync",
+            "--resync-auth",
+            "--single-directory",
+            root_name,
+            "--syncdir",
+            str(verify_root),
+            "--confdir",
+            str(conf_verify),
+        ]
+        context.log(f"Executing Test Case {self.case_id} verify: {command_to_string(verify_command)}")
+        verify_result = run_command(verify_command, cwd=context.repo_root)
+        write_text_file(verify_stdout, verify_result.stdout)
+        write_text_file(verify_stderr, verify_result.stderr)
+        details["verify_returncode"] = verify_result.returncode
+
+        verify_manifest = build_manifest(verify_root)
+        write_manifest(verify_manifest_file, verify_manifest)
+
+        details["verify_keep_exists"] = keep_verify_path.is_file()
+        details["verify_deleted_exists"] = delete_verify_path.exists()
+        details["verify_deleted_xlsx_exists"] = xlsx_pair_any_exists(delete_xlsx_verify_path)
+        details["verify_deleted_pdf_exists"] = pdf_pair_any_exists(delete_pdf_verify_path)
+        details["verify_deleted_image_exists"] = image_set_any_exists(delete_image_verify_path)
+
+        self._write_metadata(metadata_file, details)
+
+        if verify_result.returncode != 0:
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Remote verification failed with status {verify_result.returncode}",
+                artifacts,
+                details,
+            )
+
+        if not keep_verify_path.is_file():
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Remote verification is missing retained anchor file: {keep_relative}",
+                artifacts,
+                details,
+            )
+
+        if delete_verify_path.exists():
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Remote verification still contains deleted passive TXT file: {delete_relative}",
+                artifacts,
+                details,
+            )
+
+        if xlsx_pair_any_exists(delete_xlsx_verify_path):
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Remote verification still contains deleted XLSX file: {delete_xlsx_relative}",
+                artifacts,
+                details,
+            )
+
+        if image_set_any_exists(delete_image_verify_path):
+            return self.fail_result(self.case_id, self.name, f"Remote verification still contains deleted image set: {delete_image_relative}", artifacts, details)
+
+        if pdf_pair_any_exists(delete_pdf_verify_path):
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Remote verification still contains deleted PDF file: {delete_pdf_relative}",
+                artifacts,
+                details,
+            )
+
+        return self.pass_result(self.case_id, self.name, artifacts, details)

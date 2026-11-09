@@ -54,7 +54,7 @@ void main() {
 */
 
 /++
-	Provides a uniform server-side API for CGI, FastCGI, SCGI, and HTTP web applications.
+	Provides a uniform server-side API for CGI, FastCGI, SCGI, and HTTP web applications. Offers both lower- and higher- level api options among other common (optional) things like websocket and event source serving support, session management, and job scheduling.
 
 	---
 	import arsd.cgi;
@@ -74,6 +74,30 @@ void main() {
 	mixin GenericMain!hello;
 	---
 
+	Or:
+	---
+	import arsd.cgi;
+
+	class MyApi : WebObject {
+		@UrlName("")
+		string hello(string name = null) {
+			if(name is null)
+				return "Hello, world!";
+			else
+				return "Hello, " ~ name;
+		}
+	}
+	mixin DispatcherMain!(
+		"/".serveApi!MyApi
+	);
+	---
+
+	$(NOTE
+		Please note that using the higher-level api will add a dependency on arsd.dom and arsd.jsvar to your application.
+		If you use `dmd -i` or `ldc2 -i` to build, it will just work, but with dub, you will have do `dub add arsd-official:jsvar`
+		and `dub add arsd-official:dom` yourself.
+	)
+
 	Test on console (works in any interface mode):
 	$(CONSOLE
 		$ ./cgi_hello GET / name=whatever
@@ -85,8 +109,12 @@ void main() {
 		# now you can go to http://localhost:8080/?name=whatever
 	)
 
+	Please note: the default port for http is 8085 and for scgi is 4000. I recommend you set your own by the command line argument in a startup script instead of relying on any hard coded defaults. It is possible though to code your own with [RequestServer], however.
 
-	Compile_versions:
+
+	Build_Configurations:
+
+	cgi.d tries to be flexible to meet your needs. It is possible to configure it both at runtime (by writing your own `main` function and constructing a [RequestServer] object) or at compile time using the `version` switch to the compiler or a dub `subConfiguration`.
 
 	If you are using `dub`, use:
 
@@ -103,11 +131,11 @@ void main() {
 	to change versions. The possible options for `VALUE_HERE` are:
 
 	$(LIST
-		* `embedded_httpd` for the embedded httpd version (built-in web server). This is the default.
-		* `cgi` for traditional cgi binaries.
-		* `fastcgi` for FastCGI builds.
-		* `scgi` for SCGI builds.
-		* `stdio_http` for speaking raw http over stdin and stdout. See [RequestServer.serveSingleHttpConnectionOnStdio] for more information.
+		* `embedded_httpd` for the embedded httpd version (built-in web server). This is the default for dub builds. You can run the program then connect directly to it from your browser.
+		* `cgi` for traditional cgi binaries. These are run by an outside web server as-needed to handle requests.
+		* `fastcgi` for FastCGI builds. FastCGI is managed from an outside helper, there's one built into Microsoft IIS, Apache httpd, and Lighttpd, and a generic program you can use with nginx called `spawn-fcgi`. If you don't already know how to use it, I suggest you use one of the other modes.
+		* `scgi` for SCGI builds. SCGI is a simplified form of FastCGI, where you run the server as an application service which is proxied by your outside webserver.
+		* `stdio_http` for speaking raw http over stdin and stdout. This is made for systemd services. See [RequestServer.serveSingleHttpConnectionOnStdio] for more information.
 	)
 
 	With dmd, use:
@@ -125,7 +153,8 @@ void main() {
 			- A FastCGI executable will be generated.
 		* - `-version=scgi`
 			- A SCGI (SimpleCGI) executable will be generated.
-
+		* - `-version=embedded_httpd_hybrid`
+			- A HTTP server that uses a combination of processes, threads, and fibers to better handle large numbers of idle connections. Recommended if you are going to serve websockets in a non-local application.
 		* - `-version=embedded_httpd_threads`
 			- The embedded HTTP server will use a single process with a thread pool. (use instead of plain `embedded_httpd` if you want this specific implementation)
 		* - `-version=embedded_httpd_processes`
@@ -139,7 +168,7 @@ void main() {
 		  + (can be used together with others)
 
 		* - `-version=cgi_with_websocket`
-			- The CGI class has websocket server support.
+			- The CGI class has websocket server support. (This is on by default now.)
 
 		* - `-version=with_openssl`
 			- not currently used
@@ -149,8 +178,8 @@ void main() {
 			- The session will be provided in a separate process, provided by cgi.d.
 	)
 
-	Compile_and_run:
-	
+	For example,
+
 	For CGI, `dmd yourfile.d cgi.d` then put the executable in your cgi-bin directory.
 
 	For FastCGI: `dmd yourfile.d cgi.d -version=fastcgi` and run it. spawn-fcgi helps on nginx. You can put the file in the directory for Apache. On IIS, run it with a port on the command line (this causes it to call FCGX_OpenSocket, which can work on nginx too).
@@ -159,77 +188,24 @@ void main() {
 
 	For an embedded HTTP server, run `dmd yourfile.d cgi.d -version=embedded_httpd` and run the generated program. It listens on port 8085 by default. You can change this on the command line with the --port option when running your program.
 
-	You can also simulate a request by passing parameters on the command line, like:
+	Simulating_requests:
+
+	If you are using one of the [GenericMain] or [DispatcherMain] mixins, or main with your own call to [RequestServer.trySimulatedRequest], you can simulate requests from your command line shell. Call the program like this:
 
 	$(CONSOLE
 	./yourprogram GET / name=adr
 	)
 
-	And it will print the result to stdout.
+	And it will print the result to stdout instead of running a server, regardless of build more..
 
 	CGI_Setup_tips:
 
-	On Apache, you may do `SetHandler cgi-script` in your `.htaccess` file.
+	On Apache, you may do `SetHandler cgi-script` in your `.htaccess` file to set a particular file to be run through the cgi program. Note that all "subdirectories" of it also run the program; if you configure `/foo` to be a cgi script, then going to `/foo/bar` will call your cgi handler function with `cgi.pathInfo == "/bar"`.
 
-	Integration_tips:
+	Overview_Of_Basic_Concepts:
 
-	cgi.d works well with dom.d for generating html. You may also use web.d for other utilities and automatic api wrapping.
+	cgi.d offers both lower-level handler apis as well as higher-level auto-dispatcher apis. For a lower-level handler function, you'll probably want to review the following functions:
 
-	dom.d usage:
-
-	---
-		import arsd.cgi;
-		import arsd.dom;
-
-		void hello_dom(Cgi cgi) {
-			auto document = new Document();
-
-			static import std.file;
-			// parse the file in strict mode, requiring it to be well-formed UTF-8 XHTML
-			// (You'll appreciate this if you've ever had to deal with a missing </div>
-			// or something in a php or erb template before that would randomly mess up
-			// the output in your browser. Just check it and throw an exception early!)
-			//
-			// You could also hard-code a template or load one at compile time with an
-			// import expression, but you might appreciate making it a regular file
-			// because that means it can be more easily edited by the frontend team and
-			// they can see their changes without needing to recompile the program.
-			//
-			// Note on CTFE: if you do choose to load a static file at compile time,
-			// you *can* parse it in CTFE using enum, which will cause it to throw at
-			// compile time, which is kinda cool too. Be careful in modifying that document,
-			// though, as it will be a static instance. You might want to clone on on demand,
-			// or perhaps modify it lazily as you print it out. (Try element.tree, it returns
-			// a range of elements which you could send through std.algorithm functions. But
-			// since my selector implementation doesn't work on that level yet, you'll find that
-			// harder to use. Of course, you could make a static list of matching elements and
-			// then use a simple e is e2 predicate... :) )
-			document.parseUtf8(std.file.read("your_template.html"), true, true);
-
-			// fill in data using DOM functions, so placing it is in the hands of HTML
-			// and it will be properly encoded as text too.
-			//
-			// Plain html templates can't run server side logic, but I think that's a
-			// good thing - it keeps them simple. You may choose to extend the html,
-			// but I think it is best to try to stick to standard elements and fill them
-			// in with requested data with IDs or class names. A further benefit of
-			// this is the designer can also highlight data based on sources in the CSS.
-			//
-			// However, all of dom.d is available, so you can format your data however
-			// you like. You can do partial templates with innerHTML too, or perhaps better,
-			// injecting cloned nodes from a partial document.
-			//
-			// There's a lot of possibilities.
-			document["#name"].innerText = cgi.request("name", "default name");
-
-			// send the document to the browser. The second argument to `cgi.write`
-			// indicates that this is all the data at once, enabling a few small
-			// optimizations.
-			cgi.write(document.toString(), true);
-		}
-	---
-
-	Concepts:
 		Input: [Cgi.get], [Cgi.post], [Cgi.request], [Cgi.files], [Cgi.cookies], [Cgi.pathInfo], [Cgi.requestMethod],
 		       and HTTP headers ([Cgi.headers], [Cgi.userAgent], [Cgi.referrer], [Cgi.accept], [Cgi.authorization], [Cgi.lastEventId])
 
@@ -243,12 +219,175 @@ void main() {
 
 		Other Information: [Cgi.remoteAddress], [Cgi.https], [Cgi.port], [Cgi.scriptName], [Cgi.requestUri], [Cgi.getCurrentCompleteUri], [Cgi.onRequestBodyDataReceived]
 
-		Overriding behavior: [Cgi.handleIncomingDataChunk], [Cgi.prepareForIncomingDataChunks], [Cgi.cleanUpPostDataState]
+		Websockets: [Websocket], [websocketRequested], [acceptWebsocket]. For websockets, use the `embedded_httpd_hybrid` build mode for best results, because it is optimized for handling large numbers of idle connections compared to the other build modes.
 
-		Installing: Apache, IIS, CGI, FastCGI, SCGI, embedded HTTPD (not recommended for production use)
+		Overriding behavior for special cases streaming input data: see the virtual functions [Cgi.handleIncomingDataChunk], [Cgi.prepareForIncomingDataChunks], [Cgi.cleanUpPostDataState]
+
+	A basic program using the lower-level api might look like:
+
+		---
+		import arsd.cgi;
+
+		// you write a request handler which always takes a Cgi object
+		void handler(Cgi cgi) {
+			/+
+				when the user goes to your site, suppose you are being hosted at http://example.com/yourapp
+
+				If the user goes to http://example.com/yourapp/test?name=value
+				then the url will be parsed out into the following pieces:
+
+					cgi.pathInfo == "/test". This is everything after yourapp's name. (If you are doing an embedded http server, your app's name is blank, so pathInfo will be the whole path of the url.)
+
+					cgi.scriptName == "yourapp". With an embedded http server, this will be blank.
+
+					cgi.host == "example.com"
+
+					cgi.https == false
+
+					cgi.queryString == "name=value" (there's also cgi.search, which will be "?name=value", including the ?)
+
+					The query string is further parsed into the `get` and `getArray` members, so:
+
+					cgi.get == ["name": "value"], meaning you can do `cgi.get["name"] == "value"`
+
+					And
+
+					cgi.getArray == ["name": ["value"]].
+
+					Why is there both `get` and `getArray`? The standard allows names to be repeated. This can be very useful,
+					it is how http forms naturally pass multiple items like a set of checkboxes. So `getArray` is the complete data
+					if you need it. But since so often you only care about one value, the `get` member provides more convenient access.
+
+				We can use these members to process the request and build link urls. Other info from the request are in other members, we'll look at them later.
+			+/
+			switch(cgi.pathInfo) {
+				// the home page will be a small html form that can set a cookie.
+				case "/":
+					cgi.write(`<!DOCTYPE html>
+					<html>
+					<body>
+						<form method="POST" action="set-cookie">
+							<label>Your name: <input type="text" name="name" /></label>
+							<input type="submit" value="Submit" />
+						</form>
+					</body>
+					</html>
+					`, true); // the , true tells it that this is the one, complete response i want to send, allowing some optimizations.
+				break;
+				// POSTing to this will set a cookie with our submitted name
+				case "/set-cookie":
+					// HTTP has a number of request methods (also called "verbs") to tell
+					// what you should do with the given resource.
+					// The most common are GET and POST, the ones used in html forms.
+					// You can check which one was used with the `cgi.requestMethod` property.
+					if(cgi.requestMethod == Cgi.RequestMethod.POST) {
+
+						// headers like redirections need to be set before we call `write`
+						cgi.setResponseLocation("read-cookie");
+
+						// just like how url params go into cgi.get/getArray, form data submitted in a POST
+						// body go to cgi.post/postArray. Please note that a POST request can also have get
+						// params in addition to post params.
+						//
+						// There's also a convenience function `cgi.request("name")` which checks post first,
+						// then get if it isn't found there, and then returns a default value if it is in neither.
+						if("name" in cgi.post) {
+							// we can set cookies with a method too
+							// again, cookies need to be set before calling `cgi.write`, since they
+							// are a kind of header.
+							cgi.setCookie("name" , cgi.post["name"]);
+						}
+
+						// the user will probably never see this, since the response location
+						// is an automatic redirect, but it is still best to say something anyway
+						cgi.write("Redirecting you to see the cookie...", true);
+					} else {
+						// you can write out response codes and headers
+						// as well as response bodies
+						//
+						// But always check the cgi docs before using the generic
+						// `header` method - if there is a specific method for your
+						// header, use it before resorting to the generic one to avoid
+						// a header value from being sent twice.
+						cgi.setResponseLocation("405 Method Not Allowed");
+						// there is no special accept member, so you can use the generic header function
+						cgi.header("Accept: POST");
+						// but content type does have a method, so prefer to use it:
+						cgi.setResponseContentType("text/plain");
+
+						// all the headers are buffered, and will be sent upon the first body
+						// write. you can actually modify some of them before sending if need be.
+						cgi.write("You must use the POST http verb on this resource.", true);
+					}
+				break;
+				// and GETting this will read the cookie back out
+				case "/read-cookie":
+					// I did NOT pass `,true` here because this is writing a partial response.
+					// It is possible to stream data to the user in chunks by writing partial
+					// responses the calling `cgi.flush();` to send the partial response immediately.
+					// normally, you'd only send partial chunks if you have to - it is better to build
+					// a response as a whole and send it as a whole whenever possible - but here I want
+					// to demo that you can.
+					cgi.write("Hello, ");
+					if("name" in cgi.cookies) {
+						import arsd.dom; // dom.d provides a lot of helpers for html
+						// since the cookie is set, we need to write it out properly to
+						// avoid cross-site scripting attacks.
+						//
+						// Getting this stuff right automatically is a benefit of using the higher
+						// level apis, but this demo is to show the fundamental building blocks, so
+						// we're responsible to take care of it.
+						cgi.write(htmlEntitiesEncode(cgi.cookies["name"]));
+					} else {
+						cgi.write("friend");
+					}
+
+					// note that I never called cgi.setResponseContentType, since the default is text/html.
+					// it doesn't hurt to do it explicitly though, just remember to do it before any cgi.write
+					// calls.
+				break;
+				default:
+					// no path matched
+					cgi.setResponseStatus("404 Not Found");
+					cgi.write("Resource not found.", true);
+			}
+		}
+
+		// and this adds the boilerplate to set up a server according to the
+		// compile version configuration and call your handler as requests come in
+		mixin GenericMain!handler; // the `handler` here is the name of your function
+		---
+
+	Even if you plan to always use the higher-level apis, I still recommend you at least familiarize yourself with the lower level functions, since they provide the lightest weight, most flexible options to get down to business if you ever need them.
+
+	In the lower-level api, the [Cgi] object represents your HTTP transaction. It has functions to describe the request and for you to send your response. It leaves the details of how you o it up to you. The general guideline though is to avoid depending any variables outside your handler function, since there's no guarantee they will survive to another handler. You can use global vars as a lazy initialized cache, but you should always be ready in case it is empty. (One exception: if you use `-version=embedded_httpd_threads -version=cgi_no_fork`, then you can rely on it more, but you should still really write things assuming your function won't have anything survive beyond its return for max scalability and compatibility.)
+
+	A basic program using the higher-level apis might look like:
+
+		---
+		/+
+		import arsd.cgi;
+
+		struct LoginData {
+			string currentUser;
+		}
+
+		class AppClass : WebObject {
+			string foo() {}
+		}
+
+		mixin DispatcherMain!(
+			"/assets/.serveStaticFileDirectory("assets/", true), // serve the files in the assets subdirectory
+			"/".serveApi!AppClass,
+			"/thing/".serveRestObject,
+		);
+		+/
+		---
 
 	Guide_for_PHP_users:
-		If you are coming from PHP, here's a quick guide to help you get started:
+		(Please note: I wrote this section in 2008. A lot of PHP hosts still ran 4.x back then, so it was common to avoid using classes - introduced in php 5 - to maintain compatibility! If you're coming from php more recently, this may not be relevant anymore, but still might help you.)
+
+		If you are coming from old-style PHP, here's a quick guide to help you get started:
 
 		$(SIDE_BY_SIDE
 			$(COLUMN
@@ -324,27 +463,101 @@ void main() {
 
 	See_Also:
 
-	You may also want to see [arsd.dom], [arsd.web], and [arsd.html] for more code for making
-	web applications.
+	You may also want to see [arsd.dom], [arsd.webtemplate], and maybe some functions from my old [arsd.html] for more code for making
+	web applications. dom and webtemplate are used by the higher-level api here in cgi.d.
 
 	For working with json, try [arsd.jsvar].
-	
+
 	[arsd.database], [arsd.mysql], [arsd.postgres], [arsd.mssql], and [arsd.sqlite] can help in
 	accessing databases.
 
-	If you are looking to access a web application via HTTP, try [std.net.curl], [arsd.curl], or [arsd.http2].
+	If you are looking to access a web application via HTTP, try [arsd.http2].
 
 	Copyright:
 
-	cgi.d copyright 2008-2021, Adam D. Ruppe. Provided under the Boost Software License.
+	cgi.d copyright 2008-2023, Adam D. Ruppe. Provided under the Boost Software License.
 
 	Yes, this file is old, and yes, it is still actively maintained and used.
 +/
 module arsd.cgi;
 
-version(Demo)
-unittest {
+// FIXME: Nullable!T can be a checkbox that enables/disables the T on the automatic form
+// and a SumType!(T, R) can be a radio box to pick between T and R to disclose the extra boxes on the automatic form
 
+/++
+	This micro-example uses the [dispatcher] api to act as a simple http file server, serving files found in the current directory and its children.
++/
+unittest {
+	import arsd.cgi;
+
+	mixin DispatcherMain!(
+		"/".serveStaticFileDirectory(null, true)
+	);
+}
+
+/++
+	Same as the previous example, but written out long-form without the use of [DispatcherMain] nor [GenericMain].
++/
+unittest {
+	import arsd.cgi;
+
+	void requestHandler(Cgi cgi) {
+		cgi.dispatcher!(
+			"/".serveStaticFileDirectory(null, true)
+		);
+	}
+
+	// mixin GenericMain!requestHandler would add this function:
+	void main(string[] args) {
+		// this is all the content of [cgiMainImpl] which you can also call
+
+		// cgi.d embeds a few add on functions like real time event forwarders
+		// and session servers it can run in other processes. this spawns them, if needed.
+		if(tryAddonServers(args))
+			return;
+
+		// cgi.d allows you to easily simulate http requests from the command line,
+		// without actually starting a server. this function will do that.
+		if(trySimulatedRequest!(requestHandler, Cgi)(args))
+			return;
+
+		RequestServer server;
+		// you can change the default port here if you like
+		// server.listeningPort = 9000;
+
+		// then call this to let the command line args override your default
+		server.configureFromCommandLine(args);
+
+		// here is where you could print out the listeningPort to the user if you wanted
+
+		// and serve the request(s) according to the compile configuration
+		server.serve!(requestHandler)();
+
+		// or you could explicitly choose a serve mode like this:
+		// server.serveEmbeddedHttp!requestHandler();
+	}
+}
+
+/++
+	 cgi.d has built-in testing helpers too. These will provide mock requests and mock sessions that
+	 otherwise run through the rest of the internal mechanisms to call your functions without actually
+	 spinning up a server.
++/
+unittest {
+	import arsd.cgi;
+
+	void requestHandler(Cgi cgi) {
+
+	}
+
+	// D doesn't let me embed a unittest inside an example unittest
+	// so this is a function, but you can do it however in your real program
+	/* unittest */ void runTests() {
+		auto tester = new CgiTester(&requestHandler);
+
+		auto response = tester.GET("/");
+		assert(response.code == 200);
+	}
 }
 
 static import std.file;
@@ -362,11 +575,22 @@ version(Posix) {
 			// GDC doesn't support static foreach so I had to cheat on it :(
 		} else version(FreeBSD) {
 			// I never implemented the fancy stuff there either
+		} else version(OpenBSD) {
+			// Fix issue #2977 - adopt same approach as FreeBSD above
 		} else {
 			version=with_breaking_cgi_features;
 			version=with_sendfd;
 			version=with_addon_servers;
 		}
+	}
+}
+
+version(Windows) {
+	version(minimal) {
+
+	} else {
+		// not too concerned about gdc here since the mingw version is fairly new as well
+		version=with_breaking_cgi_features;
 	}
 }
 
@@ -386,10 +610,15 @@ void cloexec(Socket s) {
 
 version(embedded_httpd_hybrid) {
 	version=embedded_httpd_threads;
-	version(cgi_no_fork) {} else
+	version(cgi_no_fork) {} else version(Posix)
 		version=cgi_use_fork;
 	version=cgi_use_fiber;
 }
+
+version(cgi_use_fork)
+	enum cgi_use_fork_default = true;
+else
+	enum cgi_use_fork_default = false;
 
 // the servers must know about the connections to talk to them; the interfaces are vital
 version(with_addon_servers)
@@ -456,6 +685,7 @@ enum long defaultMaxContentLength = 5_000_000;
 public import std.string;
 public import std.stdio;
 public import std.conv;
+import std.concurrency;
 import std.uri;
 import std.uni;
 import std.algorithm.comparison;
@@ -532,11 +762,11 @@ class ConnectionClosedException : Exception {
 	}
 }
 
- 
+
 version(Windows) {
 // FIXME: ugly hack to solve stdin exception problems on Windows:
 // reading stdin results in StdioException (Bad file descriptor)
-// this is probably due to http://d.puremagic.com/issues/show_bug.cgi?id=3425
+// this is probably due to https://issues.dlang.org/show_bug.cgi?id=3425
 private struct stdin {
 	struct ByChunk { // Replicates std.stdio.ByChunk
 	private:
@@ -563,14 +793,6 @@ private struct stdin {
 
 	import core.sys.windows.windows;
 static:
-
-	static this() {
-		// Set stdin to binary mode
-		version(Win64)
-		_setmode(std.stdio.stdin.fileno(), 0x8000);
-		else
-		setmode(std.stdio.stdin.fileno(), 0x8000);
-	}
 
 	T[] rawRead(T)(T[] buf) {
 		uint bytesRead;
@@ -808,7 +1030,7 @@ class Cgi {
 				}
 			} else {
 				// it is an argument of some sort
-				if(requestMethod == Cgi.RequestMethod.POST || requestMethod == Cgi.RequestMethod.PATCH || requestMethod == Cgi.RequestMethod.PUT) {
+				if(requestMethod == Cgi.RequestMethod.POST || requestMethod == Cgi.RequestMethod.PATCH || requestMethod == Cgi.RequestMethod.PUT || requestMethod == Cgi.RequestMethod.CommandLine) {
 					auto parts = breakUp(arg);
 					_post[parts[0]] ~= parts[1];
 					allPostNamesInOrder ~= parts[0];
@@ -881,7 +1103,7 @@ class Cgi {
 		const(ubyte)[] delegate() readdata = null,
 		// finally, use this to do custom output if needed
 		void delegate(const(ubyte)[]) _rawDataOutput = null,
-		// to flush teh custom output
+		// to flush the custom output
 		void delegate() _flush = null
 		)
 	{
@@ -949,7 +1171,7 @@ class Cgi {
 		{
 			import core.runtime;
 			auto sfn = getenv("SCRIPT_FILENAME");
-			scriptFileName = sfn.length ? sfn : Runtime.args[0];
+			scriptFileName = sfn.length ? sfn : (Runtime.args.length ? Runtime.args[0] : null);
 		}
 
 		bool iis = false;
@@ -973,7 +1195,7 @@ class Cgi {
 		get = keepLastOf(getArray);
 
 
-		// NOTE: on shitpache, you need to specifically forward this
+		// NOTE: on apache, you need to specifically forward this
 		authorization = getenv("HTTP_AUTHORIZATION");
 		// this is a hack because Apache is a shitload of fuck and
 		// refuses to send the real header to us. Compatible
@@ -1017,7 +1239,7 @@ class Cgi {
 		// FIXME: DOCUMENT_ROOT?
 
 		// FIXME: what about PUT?
-		if(requestMethod == RequestMethod.POST || requestMethod == Cgi.RequestMethod.PATCH || requestMethod == Cgi.RequestMethod.PUT) {
+		if(requestMethod == RequestMethod.POST || requestMethod == Cgi.RequestMethod.PATCH || requestMethod == Cgi.RequestMethod.PUT || requestMethod == Cgi.RequestMethod.CommandLine) {
 			version(preserveData) // a hack to make forwarding simpler
 				immutable(ubyte)[] data;
 			size_t amountReceived = 0;
@@ -1028,7 +1250,8 @@ class Cgi {
 			// to be slow if they did that. The spec says it is always there though.
 			// And it has worked reliably for me all year in the live environment,
 			// but some servers might be different.
-			auto contentLength = to!size_t(getenv("CONTENT_LENGTH"));
+			auto cls = getenv("CONTENT_LENGTH");
+			auto contentLength = to!size_t(cls.length ? cls : "0");
 
 			immutable originalContentLength = contentLength;
 			if(contentLength) {
@@ -1345,7 +1568,7 @@ class Cgi {
 				}
 
 				/*
-				stderr.writeln("RECEIVED: ", pps.piece.name, "=", 
+				stderr.writeln("RECEIVED: ", pps.piece.name, "=",
 					pps.piece.content.length < 1000
 					?
 					to!string(pps.piece.content)
@@ -1612,7 +1835,7 @@ class Cgi {
 	/// My idea here was so you can output a progress bar or
 	/// something to a cooperative client (see arsd.rtud for a potential helper)
 	///
-	/// The default is to do nothing. Subclass cgi and use the 
+	/// The default is to do nothing. Subclass cgi and use the
 	/// CustomCgiMain mixin to do something here.
 	void onRequestBodyDataReceived(size_t receivedSoFar, size_t totalExpected) const {
 		// This space intentionally left blank.
@@ -1742,7 +1965,7 @@ class Cgi {
 
 		{
 			import core.runtime;
-			scriptFileName = Runtime.args[0];
+			scriptFileName = Runtime.args.length ? Runtime.args[0] : null;
 		}
 
 
@@ -1857,6 +2080,8 @@ class Cgi {
 						// FIXME: if size is > max content length it should
 						// also fail at this point.
 						_rawDataOutput(cast(ubyte[]) "HTTP/1.1 100 Continue\r\n\r\n");
+
+						// FIXME: let the user write out 103 early hints too
 					}
 				}
 				// else
@@ -1964,8 +2189,8 @@ class Cgi {
 	/// application. Either use Apache's built in methods for basic authentication, or add
 	/// something along these lines to your server configuration:
 	///
-	///      RewriteEngine On 
-	///      RewriteCond %{HTTP:Authorization} ^(.*) 
+	///      RewriteEngine On
+	///      RewriteCond %{HTTP:Authorization} ^(.*)
 	///      RewriteRule ^(.*) - [E=HTTP_AUTHORIZATION:%1]
 	///
 	/// To ensure the necessary data is available to cgi.d.
@@ -2004,10 +2229,13 @@ class Cgi {
 			uri ~= "s";
 		uri ~= "://";
 		uri ~= host;
+		/+ // the host has the port so p sure this never needed, cgi on apache and embedded http all do the right thing now
+		version(none)
 		if(!(!port || port == defaultPort)) {
 			uri ~= ":";
 			uri ~= to!string(port);
 		}
+		+/
 		uri ~= requestUri;
 		return uri;
 	}
@@ -2091,7 +2319,7 @@ class Cgi {
 
 	/// This is like setResponseExpires, but it can be called multiple times. The setting most in the past is the one kept.
 	/// If you have multiple functions, they all might call updateResponseExpires about their own return value. The program
-	/// output as a whole is as cacheable as the least cachable part in the chain.
+	/// output as a whole is as cacheable as the least cacheable part in the chain.
 
 	/// setCache(false) always overrides this - it is, by definition, the strictest anti-cache statement available. If your site outputs sensitive user data, you should probably call setCache(false) when you do, to ensure no other functions will cache the content, as it may be a privacy risk.
 	/// Conversely, setting here overrides setCache(true), since any expiration date is in the past of infinity.
@@ -2103,7 +2331,7 @@ class Cgi {
 	}
 
 	/*
-	/// Set to true if you want the result to be cached publically - that is, is the content shared?
+	/// Set to true if you want the result to be cached publicly - that is, is the content shared?
 	/// Should generally be false if the user is logged in. It assumes private cache only.
 	/// setCache(true) also turns on public caching, and setCache(false) sets to private.
 	void setPublicCaching(bool allowPublicCaches) {
@@ -2189,6 +2417,17 @@ class Cgi {
 	void header(string h) {
 		customHeaders ~= h;
 	}
+
+	/++
+		I named the original function `header` after PHP, but this pattern more fits
+		the rest of the Cgi object.
+
+		Either name are allowed.
+
+		History:
+			Alias added June 17, 2022.
+	+/
+	alias setResponseHeader = header;
 
 	private string[] customHeaders;
 	private bool websocketMode;
@@ -2392,7 +2631,7 @@ class Cgi {
 			return; // don't double close
 
 		if(!outputtedResponseData)
-			write("", false, false);
+			write("", true, false);
 
 		// writing auto buffered data
 		if(requestMethod != RequestMethod.HEAD && autoBuffer) {
@@ -2420,7 +2659,7 @@ class Cgi {
 	/++
 		Gets a request variable as a specific type, or the default value of it isn't there
 		or isn't convertible to the request type.
-		
+
 		Checks both GET and POST variables, preferring the POST variable, if available.
 
 		A nice trick is using the default value to choose the type:
@@ -2517,6 +2756,23 @@ class Cgi {
 	version(preserveData) // note: this can eat lots of memory; don't use unless you're sure you need it.
 	immutable(ubyte)[] originalPostData;
 
+	/++
+		This holds the posted body data if it has not been parsed into [post] and [postArray].
+
+		It is intended to be used for JSON and XML request content types, but also may be used
+		for other content types your application can handle. But it will NOT be populated
+		for content types application/x-www-form-urlencoded or multipart/form-data, since those are
+		parsed into the post and postArray members.
+
+		Remember that anything beyond your `maxContentLength` param when setting up [GenericMain], etc.,
+		will be discarded to the client with an error. This helps keep this array from being exploded in size
+		and consuming all your server's memory (though it may still be possible to eat excess ram from a concurrent
+		client in certain build modes.)
+
+		History:
+			Added January 5, 2021
+			Documented February 21, 2023 (dub v11.0)
+	+/
 	public immutable string postBody;
 	alias postJson = postBody; // old name
 
@@ -2555,7 +2811,7 @@ class Cgi {
 	immutable(char[]) referrer;
 	immutable(char[]) requestUri; 	/// The full url if the current request, excluding the protocol and host. requestUri == scriptName ~ pathInfo ~ (queryString.length ? "?" ~ queryString : "");
 
-	immutable(char[]) remoteAddress; /// The IP address of the user, as we see it. (Might not match the IP of the user's computer due to things like proxies and NAT.) 
+	immutable(char[]) remoteAddress; /// The IP address of the user, as we see it. (Might not match the IP of the user's computer due to things like proxies and NAT.)
 
 	immutable bool https; 	/// Was the request encrypted via https?
 	immutable int port; 	/// On what TCP port number did the server receive the request?
@@ -2568,7 +2824,7 @@ class Cgi {
 
 	/**
 		Represents user uploaded files.
-		
+
 		When making a file upload form, be sure to follow the standard: set method="POST" and enctype="multipart/form-data" in your html <form> tag attributes. The key into this array is the name attribute on your input tag, just like with other post variables. See the comments on the UploadedFile struct for more information about the data inside, including important notes on max size and content location.
 	*/
 	immutable(UploadedFile[][string]) filesArray;
@@ -2887,13 +3143,16 @@ struct Uri {
 				host = authority;
 			} else {
 				host = authority[0 .. idx2];
-				port = to!int(authority[idx2 + 1 .. $]);
+				if(idx2 + 1 < authority.length)
+					port = to!int(authority[idx2 + 1 .. $]);
+				else
+					port = 0;
 			}
 		}
 
 		path_loop:
 		auto path_start = idx;
-		
+
 		foreach(char c; uri[idx .. $]) {
 			if(c == '?' || c == '#')
 				break;
@@ -2963,6 +3222,8 @@ struct Uri {
 	/// Browsers use a function like this to figure out links in html.
 	Uri basedOn(in Uri baseUrl) const {
 		Uri n = this; // copies
+		if(n.scheme == "data")
+			return n;
 		// n.uriInvalidated = true; // make sure we regenerate...
 
 		// userinfo is not inherited... is this wrong?
@@ -3272,7 +3533,11 @@ string toHexUpper(long num) {
 
 // the generic mixins
 
-/// Use this instead of writing your own main
+/++
+	Use this instead of writing your own main
+
+	It ultimately calls [cgiMainImpl] which creates a [RequestServer] for you.
++/
 mixin template GenericMain(alias fun, long maxContentLength = defaultMaxContentLength) {
 	mixin CustomCgiMain!(Cgi, fun, maxContentLength);
 }
@@ -3294,6 +3559,8 @@ mixin template DispatcherMain(Presenter, DispatcherArgs...) {
 	/++
 		Request handler that creates the presenter then forwards to the [dispatcher] function.
 		Renders 404 if the dispatcher did not handle the request.
+
+		Will automatically serve the presenter.style and presenter.script as "style.css" and "script.js"
 	+/
 	void handler(Cgi cgi) {
 		auto presenter = new Presenter;
@@ -3303,9 +3570,27 @@ mixin template DispatcherMain(Presenter, DispatcherArgs...) {
 		if(cgi.dispatcher!DispatcherArgs(presenter))
 			return;
 
-		presenter.renderBasicError(cgi, 404);
+		switch(cgi.pathInfo) {
+			case "/style.css":
+				cgi.setCache(true);
+				cgi.setResponseContentType("text/css");
+				cgi.write(presenter.style(), true);
+			break;
+			case "/script.js":
+				cgi.setCache(true);
+				cgi.setResponseContentType("application/javascript");
+				cgi.write(presenter.script(), true);
+			break;
+			default:
+				presenter.renderBasicError(cgi, 404);
+		}
 	}
 	mixin GenericMain!handler;
+}
+
+mixin template DispatcherMain(DispatcherArgs...) if(!is(DispatcherArgs[0] : WebPresenter!T, T)) {
+	class GenericPresenter : WebPresenter!GenericPresenter {}
+	mixin DispatcherMain!(GenericPresenter, DispatcherArgs);
 }
 
 private string simpleHtmlEncode(string s) {
@@ -3452,6 +3737,28 @@ struct RequestServer {
 	///
 	ushort listeningPort = defaultListeningPort();
 
+	/++
+		Uses a fork() call, if available, to provide additional crash resiliency and possibly improved performance. On the
+		other hand, if you fork, you must not assume any memory is shared between requests (you shouldn't be anyway though! But
+		if you have to, you probably want to set this to false and use an explicit threaded server with [serveEmbeddedHttp]) and
+		[stop] may not work as well.
+
+		History:
+			Added August 12, 2022  (dub v10.9). Previously, this was only configurable through the `-version=cgi_no_fork`
+			argument to dmd. That version still defines the value of `cgi_use_fork_default`, used to initialize this, for
+			compatibility.
+	+/
+	bool useFork = cgi_use_fork_default;
+
+	/++
+		Determines the number of worker threads to spawn per process, for server modes that use worker threads. 0 will use a
+		default based on the number of cpus modified by the server mode.
+
+		History:
+			Added August 12, 2022 (dub v10.9)
+	+/
+	int numberOfThreads = 0;
+
 	///
 	this(string defaultHost, ushort defaultPort) {
 		this.listeningHost = defaultHost;
@@ -3463,7 +3770,11 @@ struct RequestServer {
 		listeningPort = defaultPort;
 	}
 
-	/// Reads the args into the other values.
+	/++
+		Reads the command line arguments into the values here.
+
+		Possible arguments are `--listening-host`, `--listening-port` (or `--port`), `--uid`, and `--gid`.
+	+/
 	void configureFromCommandLine(string[] args) {
 		bool foundPort = false;
 		bool foundHost = false;
@@ -3479,11 +3790,11 @@ struct RequestServer {
 				foundHost = false;
 			}
 			if(foundUid) {
-				privDropUserId = to!int(arg);
+				privilegesDropToUid = to!uid_t(arg);
 				foundUid = false;
 			}
 			if(foundGid) {
-				privDropGroupId = to!int(arg);
+				privilegesDropToGid = to!gid_t(arg);
 				foundGid = false;
 			}
 			if(arg == "--listening-host" || arg == "-h" || arg == "/listening-host")
@@ -3497,7 +3808,37 @@ struct RequestServer {
 		}
 	}
 
-	// FIXME: the privDropUserId/group id need to be set in here instead of global
+	version(Windows) {
+		private alias uid_t = int;
+		private alias gid_t = int;
+	}
+
+	/// user (uid) to drop privileges to
+	/// 0 … do nothing
+	uid_t privilegesDropToUid = 0;
+	/// group (gid) to drop privileges to
+	/// 0 … do nothing
+	gid_t privilegesDropToGid = 0;
+
+	private void dropPrivileges() {
+		version(Posix) {
+			import core.sys.posix.unistd;
+
+			if (privilegesDropToGid != 0 && setgid(privilegesDropToGid) != 0)
+				throw new Exception("Dropping privileges via setgid() failed.");
+
+			if (privilegesDropToUid != 0 && setuid(privilegesDropToUid) != 0)
+				throw new Exception("Dropping privileges via setuid() failed.");
+		}
+		else {
+			// FIXME: Windows?
+			//pragma(msg, "Dropping privileges is not implemented for this platform");
+		}
+
+		// done, set zero
+		privilegesDropToGid = 0;
+		privilegesDropToUid = 0;
+	}
 
 	/++
 		Serves a single HTTP request on this thread, with an embedded server, then stops. Designed for cases like embedded oauth responders
@@ -3526,7 +3867,7 @@ struct RequestServer {
 
 		bool tcp;
 		void delegate() cleanup;
-		auto socket = startListening(listeningHost, listeningPort, tcp, cleanup, 1);
+		auto socket = startListening(listeningHost, listeningPort, tcp, cleanup, 1, &dropPrivileges);
 		auto connection = socket.accept();
 		doThreadHttpConnectionGuts!(CustomCgi, fun, true)(connection);
 
@@ -3567,19 +3908,40 @@ struct RequestServer {
 		}
 	}
 
-	void serveEmbeddedHttp(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)() {
-		auto manager = new ListeningConnectionManager(listeningHost, listeningPort, &doThreadHttpConnection!(CustomCgi, fun));
+	/++
+		Runs the embedded HTTP thread server specifically, regardless of which build configuration you have.
+
+		If you want the forking worker process server, you do need to compile with the embedded_httpd_processes config though.
+	+/
+	shared void serveEmbeddedHttp(alias fun, T, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)(shared T _this) {
+		globalStopFlag = false;
+		static if(__traits(isStaticFunction, fun))
+			void funToUse(CustomCgi cgi) {
+				fun(_this, cgi);
+			}
+		else
+			void funToUse(CustomCgi cgi) {
+				static if(__VERSION__ > 2097)
+					__traits(child, _inst_this, fun)(_inst_this, cgi);
+				else static assert(0, "Not implemented in your compiler version!");
+			}
+		auto manager = new ListeningConnectionManager(listeningHost, listeningPort, &doThreadHttpConnection!(CustomCgi, funToUse), null, useFork, numberOfThreads);
 		manager.listen();
 	}
+
+	/++
+		Runs the embedded SCGI server specifically, regardless of which build configuration you have.
+	+/
 	void serveScgi(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)() {
-		auto manager = new ListeningConnectionManager(listeningHost, listeningPort, &doThreadScgiConnection!(CustomCgi, fun, maxContentLength));
+		globalStopFlag = false;
+		auto manager = new ListeningConnectionManager(listeningHost, listeningPort, &doThreadScgiConnection!(CustomCgi, fun, maxContentLength), null, useFork, numberOfThreads);
 		manager.listen();
 	}
 
 	/++
 		Serves a single "connection", but the connection is spoken on stdin and stdout instead of on a socket.
 
-		Intended for cases like working from systemd, like discussed here: https://forum.dlang.org/post/avmkfdiitirnrenzljwc@forum.dlang.org
+		Intended for cases like working from systemd, like discussed here: [https://forum.dlang.org/post/avmkfdiitirnrenzljwc@forum.dlang.org]
 
 		History:
 			Added May 29, 2021
@@ -3588,32 +3950,81 @@ struct RequestServer {
 		doThreadHttpConnectionGuts!(CustomCgi, fun, true)(new FakeSocketForStdin());
 	}
 
-	void stop() {
-		// FIXME
+	/++
+		The [stop] function sets a flag that request handlers can (and should) check periodically. If a handler doesn't
+		respond to this flag, the library will force the issue. This determines when and how the issue will be forced.
+	+/
+	enum ForceStop {
+		/++
+			Stops accepting new requests, but lets ones already in the queue start and complete before exiting.
+		+/
+		afterQueuedRequestsComplete,
+		/++
+			Finishes requests already started their handlers, but drops any others in the queue. Streaming handlers
+			should cooperate and exit gracefully, but if they don't, it will continue waiting for them.
+		+/
+		afterCurrentRequestsComplete,
+		/++
+			Partial response writes will throw an exception, cancelling any streaming response, but complete
+			writes will continue to process. Request handlers that respect the stop token will also gracefully cancel.
+		+/
+		cancelStreamingRequestsEarly,
+		/++
+			All writes will throw.
+		+/
+		cancelAllRequestsEarly,
+		/++
+			Use OS facilities to forcibly kill running threads. The server process will be in an undefined state after this call (if this call ever returns).
+		+/
+		forciblyTerminate,
 	}
-}
 
-private int privDropUserId;
-private int privDropGroupId;
+	version(embedded_httpd_processes) {} else
+	/++
+		Stops serving after the current requests are completed.
 
-// Added Jan 11, 2021
-private void dropPrivs() {
-	version(Posix) {
-		import core.sys.posix.unistd;
+		Bugs:
+			Not implemented on version=embedded_httpd_processes, version=fastcgi on any system, or embedded_httpd on Windows (it does work on embedded_httpd_hybrid
+			on Windows however). Only partially implemented on non-Linux posix systems.
 
-		auto userId = privDropUserId;
-		auto groupId = privDropGroupId;
+			You might also try SIGINT perhaps.
 
-		if((userId != 0 || groupId != 0) && getuid() == 0) {
-			if(groupId)
-				setgid(groupId);
-			if(userId)
-				setuid(userId);
+			The stopPriority is not yet fully implemented.
+	+/
+	static void stop(ForceStop stopPriority = ForceStop.afterCurrentRequestsComplete) {
+		globalStopFlag = true;
+
+		version(Posix) {
+			if(cancelfd > 0) {
+				ulong a = 1;
+				core.sys.posix.unistd.write(cancelfd, &a, a.sizeof);
+			}
 		}
-
+		version(Windows) {
+			if(iocp) {
+				foreach(i; 0 .. 16) // FIXME
+				PostQueuedCompletionStatus(iocp, 0, cast(ULONG_PTR) null, null);
+			}
+		}
 	}
-	// FIXME: Windows?
 }
+
+private alias AliasSeq(T...) = T;
+
+version(with_breaking_cgi_features)
+mixin(q{
+	template ThisFor(alias t) {
+		static if(__traits(isStaticFunction, t)) {
+			alias ThisFor = AliasSeq!();
+		} else {
+			alias ThisFor = __traits(parent, t);
+		}
+	}
+});
+else
+	alias ThisFor(alias t) = AliasSeq!();
+
+private __gshared bool globalStopFlag = false;
 
 version(embedded_httpd_processes)
 void serveEmbeddedHttpdProcesses(alias fun, CustomCgi = Cgi)(RequestServer params) {
@@ -3658,7 +4069,7 @@ void serveEmbeddedHttpdProcesses(alias fun, CustomCgi = Cgi)(RequestServer param
 			close(sock);
 			throw new Exception("listen");
 		}
-		dropPrivs();
+		params.dropPrivileges();
 	}
 
 	version(embedded_httpd_processes_accept_after_fork) {} else {
@@ -3726,7 +4137,7 @@ void serveEmbeddedHttpdProcesses(alias fun, CustomCgi = Cgi)(RequestServer param
 						Cgi cgi;
 						try {
 							cgi = new CustomCgi(ir, &closeConnection);
-							cgi._outputFileHandle = s;
+							cgi._outputFileHandle = cast(CgiConnectionHandle) s;
 							// if we have a single process and the browser tries to leave the connection open while concurrently requesting another, it will block everything an deadlock since there's no other server to accept it. By closing after each request in this situation, it tells the browser to serialize for us.
 							if(processPoolSize <= 1)
 								closeConnection = true;
@@ -3927,13 +4338,24 @@ void serveFastCgi(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMax
 	}
 
 	auto lp = params.listeningPort;
+	auto host = params.listeningHost;
 
 	FCGX_Request request;
-	if(lp) {
+	if(lp || !host.empty) {
 		// if a listening port was specified on the command line, we want to spawn ourself
 		// (needed for nginx without spawn-fcgi, e.g. on Windows)
 		FCGX_Init();
-		auto sock = FCGX_OpenSocket(toStringz(params.listeningHost ~ ":" ~ to!string(lp)), 12);
+
+		int sock;
+
+		if(host.startsWith("unix:")) {
+			sock = FCGX_OpenSocket(toStringz(params.listeningHost["unix:".length .. $]), 12);
+		} else if(host.startsWith("abstract:")) {
+			sock = FCGX_OpenSocket(toStringz("\0" ~ params.listeningHost["abstract:".length .. $]), 12);
+		} else {
+			sock = FCGX_OpenSocket(toStringz(params.listeningHost ~ ":" ~ to!string(lp)), 12);
+		}
+
 		if(sock < 0)
 			throw new Exception("Couldn't listen on the port");
 		FCGX_InitRequest(&request, sock, 0);
@@ -3985,6 +4407,8 @@ string defaultListeningHost() {
 /++
 	This is the function [GenericMain] calls. View its source for some simple boilerplate you can copy/paste and modify, or you can call it yourself from your `main`.
 
+	Please note that this may spawn other helper processes that will call `main` again. It does this currently for the timer server and event source server (and the quasi-deprecated web socket server).
+
 	Params:
 		fun = Your request handler
 		CustomCgi = a subclass of Cgi, if you wise to customize it further
@@ -3992,7 +4416,7 @@ string defaultListeningHost() {
 		args = command-line arguments
 
 	History:
-	Documented Sept 26, 2020.
+		Documented Sept 26, 2020.
 +/
 void cgiMainImpl(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)(string[] args) if(is(CustomCgi : Cgi)) {
 	if(tryAddonServers(args))
@@ -4015,13 +4439,25 @@ void cgiMainImpl(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxC
 //version(plain_cgi)
 void handleCgiRequest(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)() {
 	// standard CGI is the default version
+
+
+	// Set stdin to binary mode if necessary to avoid mangled newlines
+	// the fact that stdin is global means this could be trouble but standard cgi request
+	// handling is one per process anyway so it shouldn't actually be threaded here or anything.
+	version(Windows) {
+		version(Win64)
+		_setmode(std.stdio.stdin.fileno(), 0x8000);
+		else
+		setmode(std.stdio.stdin.fileno(), 0x8000);
+	}
+
 	Cgi cgi;
 	try {
 		cgi = new CustomCgi(maxContentLength);
 		version(Posix)
-			cgi._outputFileHandle = 1; // stdout
+			cgi._outputFileHandle = cast(CgiConnectionHandle) 1; // stdout
 		else version(Windows)
-			cgi._outputFileHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+			cgi._outputFileHandle = cast(CgiConnectionHandle) GetStdHandle(STD_OUTPUT_HANDLE);
 		else static assert(0);
 	} catch(Throwable t) {
 		version(CRuntime_Musl) {
@@ -4058,6 +4494,8 @@ void handleCgiRequest(alias fun, CustomCgi = Cgi, long maxContentLength = defaul
 	}
 }
 
+private __gshared int cancelfd = -1;
+
 /+
 	The event loop for embedded_httpd_threads will prolly fiber dispatch
 	cgi constructors too, so slow posts will not monopolize a worker thread.
@@ -4080,7 +4518,7 @@ void handleCgiRequest(alias fun, CustomCgi = Cgi, long maxContentLength = defaul
 		specify if you yield all bets are off.
 
 		when the request is finished, if there's more data buffered, it just
-		keeps going. if there is no more data buffered, it epoll ctls to 
+		keeps going. if there is no more data buffered, it epoll ctls to
 		get triggered when more data comes in. all one shot.
 
 		when a connection is closed, the fiber returns and is then reset
@@ -4140,22 +4578,259 @@ class CgiFiber : Fiber {
 	}
 
 	void proceed() {
-		call();
-		auto py = postYield;
-		postYield = null;
-		if(py !is null)
-			py();
+		try {
+			call();
+			auto py = postYield;
+			postYield = null;
+			if(py !is null)
+				py();
+		} catch(Exception e) {
+			if(connection)
+				connection.close();
+			goto terminate;
+		}
+
 		if(state == State.TERM) {
+			terminate:
 			import core.memory;
 			GC.removeRoot(cast(void*) this);
 		}
 	}
 }
 
+version(cgi_use_fiber)
+version(Windows) {
+
+extern(Windows) private {
+
+	import core.sys.windows.mswsock;
+
+	alias GROUP=uint;
+	alias LPWSAPROTOCOL_INFOW = void*;
+	SOCKET WSASocketW(int af, int type, int protocol, LPWSAPROTOCOL_INFOW lpProtocolInfo, GROUP g, DWORD dwFlags);
+	int WSASend(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesSent, DWORD dwFlags, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
+	int WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
+
+	struct WSABUF {
+		ULONG len;
+		CHAR  *buf;
+	}
+	alias LPWSABUF = WSABUF*;
+
+	alias WSAOVERLAPPED = OVERLAPPED;
+	alias LPWSAOVERLAPPED = LPOVERLAPPED;
+	/+
+
+	alias LPFN_ACCEPTEX =
+		BOOL
+		function(
+				SOCKET sListenSocket,
+				SOCKET sAcceptSocket,
+				//_Out_writes_bytes_(dwReceiveDataLength+dwLocalAddressLength+dwRemoteAddressLength) PVOID lpOutputBuffer,
+				void* lpOutputBuffer,
+				WORD dwReceiveDataLength,
+				WORD dwLocalAddressLength,
+				WORD dwRemoteAddressLength,
+				LPDWORD lpdwBytesReceived,
+				LPOVERLAPPED lpOverlapped
+			);
+
+	enum WSAID_ACCEPTEX = GUID([0xb5367df1,0xcbac,0x11cf,[0x95,0xca,0x00,0x80,0x5f,0x48,0xa1,0x92]]);
+	+/
+
+	enum WSAID_GETACCEPTEXSOCKADDRS = GUID(0xb5367df2,0xcbac,0x11cf,[0x95,0xca,0x00,0x80,0x5f,0x48,0xa1,0x92]);
+}
+
+private class PseudoblockingOverlappedSocket : Socket {
+	SOCKET handle;
+
+	CgiFiber fiber;
+
+	this(AddressFamily af, SocketType st) {
+		auto handle = WSASocketW(af, st, 0, null, 0, 1 /*WSA_FLAG_OVERLAPPED*/);
+		if(!handle)
+			throw new Exception("WSASocketW");
+		this.handle = handle;
+
+		iocp = CreateIoCompletionPort(cast(HANDLE) handle, iocp, cast(ULONG_PTR) cast(void*) this, 0);
+
+		if(iocp is null) {
+			writeln(GetLastError());
+			throw new Exception("CreateIoCompletionPort");
+		}
+
+		super(cast(socket_t) handle, af);
+	}
+	this() pure nothrow @trusted { assert(0); }
+
+	override void blocking(bool) {} // meaningless to us, just ignore it.
+
+	protected override Socket accepting() pure nothrow {
+		assert(0);
+	}
+
+	bool addressesParsed;
+	Address la;
+	Address ra;
+
+	private void populateAddresses() {
+		if(addressesParsed)
+			return;
+		addressesParsed = true;
+
+		int lalen, ralen;
+
+		sockaddr_in* la;
+		sockaddr_in* ra;
+
+		lpfnGetAcceptExSockaddrs(
+			scratchBuffer.ptr,
+			0, // same as in the AcceptEx call!
+			sockaddr_in.sizeof + 16,
+			sockaddr_in.sizeof + 16,
+			cast(sockaddr**) &la,
+			&lalen,
+			cast(sockaddr**) &ra,
+			&ralen
+		);
+
+		if(la)
+			this.la = new InternetAddress(*la);
+		if(ra)
+			this.ra = new InternetAddress(*ra);
+
+	}
+
+	override @property @trusted Address localAddress() {
+		populateAddresses();
+		return la;
+	}
+	override @property @trusted Address remoteAddress() {
+		populateAddresses();
+		return ra;
+	}
+
+	PseudoblockingOverlappedSocket accepted;
+
+	__gshared static LPFN_ACCEPTEX lpfnAcceptEx;
+	__gshared static typeof(&GetAcceptExSockaddrs) lpfnGetAcceptExSockaddrs;
+
+	override Socket accept() @trusted {
+		__gshared static LPFN_ACCEPTEX lpfnAcceptEx;
+
+		if(lpfnAcceptEx is null) {
+			DWORD dwBytes;
+			GUID GuidAcceptEx = WSAID_ACCEPTEX;
+
+			auto iResult = WSAIoctl(handle, 0xc8000006 /*SIO_GET_EXTENSION_FUNCTION_POINTER*/,
+					&GuidAcceptEx, GuidAcceptEx.sizeof,
+					&lpfnAcceptEx, lpfnAcceptEx.sizeof,
+					&dwBytes, null, null);
+
+			GuidAcceptEx = WSAID_GETACCEPTEXSOCKADDRS;
+			iResult = WSAIoctl(handle, 0xc8000006 /*SIO_GET_EXTENSION_FUNCTION_POINTER*/,
+					&GuidAcceptEx, GuidAcceptEx.sizeof,
+					&lpfnGetAcceptExSockaddrs, lpfnGetAcceptExSockaddrs.sizeof,
+					&dwBytes, null, null);
+
+		}
+
+		auto pfa = new PseudoblockingOverlappedSocket(AddressFamily.INET, SocketType.STREAM);
+		accepted = pfa;
+
+		SOCKET pendingForAccept = pfa.handle;
+		DWORD ignored;
+
+		auto ret = lpfnAcceptEx(handle,
+			pendingForAccept,
+			// buffer to receive up front
+			pfa.scratchBuffer.ptr,
+			0,
+			// size of local and remote addresses. normally + 16.
+			sockaddr_in.sizeof + 16,
+			sockaddr_in.sizeof + 16,
+			&ignored, // bytes would be given through the iocp instead but im not even requesting the thing
+			&overlapped
+		);
+
+		return pfa;
+	}
+
+	override void connect(Address to) { assert(0); }
+
+	DWORD lastAnswer;
+	ubyte[1024] scratchBuffer;
+	static assert(scratchBuffer.length > sockaddr_in.sizeof * 2 + 32);
+
+	WSABUF[1] buffer;
+	OVERLAPPED overlapped;
+	override ptrdiff_t send(scope const(void)[] buf, SocketFlags flags) @trusted {
+		overlapped = overlapped.init;
+		buffer[0].len = cast(DWORD) buf.length;
+		buffer[0].buf = cast(CHAR*) buf.ptr;
+		fiber.setPostYield( () {
+			if(!WSASend(handle, buffer.ptr, cast(DWORD) buffer.length, null, 0, &overlapped, null)) {
+				if(GetLastError() != 997) {
+					//throw new Exception("WSASend fail");
+				}
+			}
+		});
+
+		Fiber.yield();
+		return lastAnswer;
+	}
+	override ptrdiff_t receive(scope void[] buf, SocketFlags flags) @trusted {
+		overlapped = overlapped.init;
+		buffer[0].len = cast(DWORD) buf.length;
+		buffer[0].buf = cast(CHAR*) buf.ptr;
+
+		DWORD flags2 = 0;
+
+		fiber.setPostYield(() {
+			if(!WSARecv(handle, buffer.ptr, cast(DWORD) buffer.length, null, &flags2 /* flags */, &overlapped, null)) {
+				if(GetLastError() != 997) {
+					//writeln("WSARecv ", WSAGetLastError());
+					//throw new Exception("WSARecv fail");
+				}
+			}
+		});
+
+		Fiber.yield();
+		return lastAnswer;
+	}
+
+	// I might go back and implement these for udp things.
+	override ptrdiff_t receiveFrom(scope void[] buf, SocketFlags flags, ref Address from) @trusted {
+		assert(0);
+	}
+	override ptrdiff_t receiveFrom(scope void[] buf, SocketFlags flags) @trusted {
+		assert(0);
+	}
+	override ptrdiff_t sendTo(scope const(void)[] buf, SocketFlags flags, Address to) @trusted {
+		assert(0);
+	}
+	override ptrdiff_t sendTo(scope const(void)[] buf, SocketFlags flags) @trusted {
+		assert(0);
+	}
+
+	// lol overload sets
+	alias send = typeof(super).send;
+	alias receive = typeof(super).receive;
+	alias sendTo = typeof(super).sendTo;
+	alias receiveFrom = typeof(super).receiveFrom;
+
+}
+}
+
 void doThreadHttpConnection(CustomCgi, alias fun)(Socket connection) {
 	assert(connection !is null);
 	version(cgi_use_fiber) {
 		auto fiber = new CgiFiber(&doThreadHttpConnectionGuts!(CustomCgi, fun));
+
+		version(Windows) {
+			(cast(PseudoblockingOverlappedSocket) connection).fiber = fiber;
+		}
+
 		import core.memory;
 		GC.addRoot(cast(void*) fiber);
 		fiber.connection = connection;
@@ -4168,8 +4843,10 @@ void doThreadHttpConnection(CustomCgi, alias fun)(Socket connection) {
 void doThreadHttpConnectionGuts(CustomCgi, alias fun, bool alwaysCloseConnection = false)(Socket connection) {
 	scope(failure) {
 		// catch all for other errors
-		sendAll(connection, plainHttpError(false, "500 Internal Server Error", null));
-		connection.close();
+		try {
+			sendAll(connection, plainHttpError(false, "500 Internal Server Error", null));
+			connection.close();
+		} catch(Exception e) {} // swallow it, we're aborting anyway.
 	}
 
 	bool closeConnection = alwaysCloseConnection;
@@ -4200,7 +4877,11 @@ void doThreadHttpConnectionGuts(CustomCgi, alias fun, bool alwaysCloseConnection
 		Cgi cgi;
 		try {
 			cgi = new CustomCgi(ir, &closeConnection);
-			cgi._outputFileHandle = connection.handle;
+			// There's a bunch of these casts around because the type matches up with
+			// the -version=.... specifiers, just you can also create a RequestServer
+			// and instantiate the things where the types don't match up. It isn't exactly
+			// correct but I also don't care rn. Might FIXME and either remove it later or something.
+			cgi._outputFileHandle = cast(CgiConnectionHandle) connection.handle;
 		} catch(ConnectionClosedException ce) {
 			closeConnection = true;
 			break;
@@ -4243,6 +4924,9 @@ void doThreadHttpConnectionGuts(CustomCgi, alias fun, bool alwaysCloseConnection
 			if(!handleException(cgi, t))
 				closeConnection = true;
 		}
+
+		if(globalStopFlag)
+			closeConnection = true;
 
 		if(closeConnection || alwaysCloseConnection) {
 			connection.shutdown(SocketShutdown.BOTH);
@@ -4351,7 +5035,7 @@ void doThreadScgiConnection(CustomCgi, alias fun, long maxContentLength)(Socket 
 	Cgi cgi;
 	try {
 		cgi = new CustomCgi(maxContentLength, headers, &getScgiChunk, &writeScgi, &flushScgi);
-		cgi._outputFileHandle = connection.handle;
+		cgi._outputFileHandle = cast(CgiConnectionHandle) connection.handle;
 	} catch(Throwable t) {
 		sendAll(connection, plainHttpError(true, "400 Bad Request", t));
 		connection.close();
@@ -4509,16 +5193,30 @@ import std.socket;
 
 version(cgi_use_fiber) {
 	import core.thread;
-	import core.sys.linux.epoll;
 
-	__gshared int epfd;
+	version(linux) {
+		import core.sys.linux.epoll;
+
+		int epfd = -1; // thread local because EPOLLEXCLUSIVE works much better this way... weirdly.
+	} else version(Windows) {
+		// declaring the iocp thing below...
+	} else static assert(0, "The hybrid fiber server is not implemented on your OS.");
 }
 
+version(Windows)
+	__gshared HANDLE iocp;
 
-version(cgi_use_fiber)
-private enum WakeupEvent {
-	Read = EPOLLIN,
-	Write = EPOLLOUT
+version(cgi_use_fiber) {
+	version(linux)
+	private enum WakeupEvent {
+		Read = EPOLLIN,
+		Write = EPOLLOUT
+	}
+	else version(Windows)
+	private enum WakeupEvent {
+		Read, Write
+	}
+	else static assert(0);
 }
 
 version(cgi_use_fiber)
@@ -4527,35 +5225,45 @@ private void registerEventWakeup(bool* registered, Socket source, WakeupEvent e)
 	// static cast since I know what i have in here and don't want to pay for dynamic cast
 	auto f = cast(CgiFiber) cast(void*) Fiber.getThis();
 
-	f.setPostYield = () {
-		if(*registered) {
-			// rearm
-			epoll_event evt;
-			evt.events = e | EPOLLONESHOT;
-			evt.data.ptr = cast(void*) f;
-			if(epoll_ctl(epfd, EPOLL_CTL_MOD, source.handle, &evt) == -1)
-				throw new Exception("epoll_ctl");
-		} else {
-			// initial registration
-			*registered = true ;
-			int fd = source.handle;
-			epoll_event evt;
-			evt.events = e | EPOLLONESHOT;
-			evt.data.ptr = cast(void*) f;
-			if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &evt) == -1)
-				throw new Exception("epoll_ctl");
-		}
-	};
+	version(linux) {
+		f.setPostYield = () {
+			if(*registered) {
+				// rearm
+				epoll_event evt;
+				evt.events = e | EPOLLONESHOT;
+				evt.data.ptr = cast(void*) f;
+				if(epoll_ctl(epfd, EPOLL_CTL_MOD, source.handle, &evt) == -1)
+					throw new Exception("epoll_ctl");
+			} else {
+				// initial registration
+				*registered = true ;
+				int fd = source.handle;
+				epoll_event evt;
+				evt.events = e | EPOLLONESHOT;
+				evt.data.ptr = cast(void*) f;
+				if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &evt) == -1)
+					throw new Exception("epoll_ctl");
+			}
+		};
 
-	Fiber.yield();
+		Fiber.yield();
 
-	f.setPostYield(null);
+		f.setPostYield(null);
+	} else version(Windows) {
+		Fiber.yield();
+	}
+	else static assert(0);
 }
 
 version(cgi_use_fiber)
 void unregisterSource(Socket s) {
-	epoll_event evt;
-	epoll_ctl(epfd, EPOLL_CTL_DEL, s.handle(), &evt);
+	version(linux) {
+		epoll_event evt;
+		epoll_ctl(epfd, EPOLL_CTL_DEL, s.handle(), &evt);
+	} else version(Windows) {
+		// intentionally blank
+	}
+	else static assert(0);
 }
 
 // it is a class primarily for reference semantics
@@ -4651,7 +5359,7 @@ class BufferedInputRange {
 						// gonna treat a timeout here as a close
 						sourceClosed = true;
 						return;
-					} 
+					}
 				}
 				version(Posix) {
 					import core.stdc.errno;
@@ -4683,7 +5391,6 @@ class BufferedInputRange {
 	/// You do not need to call this if you always want to wait for more data when you
 	/// consume some.
 	ubyte[] consume(size_t bytes) {
-		//import std.stdio; writeln("consuime ", bytes, "/", view.length);
 		view = view[bytes > $ ? $ : bytes .. $];
 		if(view.length == 0) {
 			view = underlyingBuffer[0 .. 0]; // go ahead and reuse the beginning
@@ -4727,20 +5434,20 @@ private class FakeSocketForStdin : Socket {
 
 	private bool closed;
 
-	override ptrdiff_t receive(void[] buffer, std.socket.SocketFlags) @trusted {
+	override ptrdiff_t receive(scope void[] buffer, std.socket.SocketFlags) @trusted {
 		if(closed)
 			throw new Exception("Closed");
 		return stdin.rawRead(buffer).length;
 	}
 
-	override ptrdiff_t send(const void[] buffer, std.socket.SocketFlags) @trusted {
+	override ptrdiff_t send(const scope void[] buffer, std.socket.SocketFlags) @trusted {
 		if(closed)
 			throw new Exception("Closed");
 		stdout.rawWrite(buffer);
 		return buffer.length;
 	}
 
-	override void close() @trusted {
+	override void close() @trusted scope {
 		(cast(void delegate() @nogc nothrow) &realClose)();
 	}
 
@@ -4748,7 +5455,7 @@ private class FakeSocketForStdin : Socket {
 		// FIXME
 	}
 
-	override void setOption(SocketOptionLevel, SocketOption, void[]) {}
+	override void setOption(SocketOptionLevel, SocketOption, scope void[]) {}
 	override void setOption(SocketOptionLevel, SocketOption, Duration) {}
 
 	override @property @trusted Address remoteAddress() { return null; }
@@ -4771,9 +5478,13 @@ import core.atomic;
 /**
 	To use this thing:
 
+	---
 	void handler(Socket s) { do something... }
-	auto manager = new ListeningConnectionManager("127.0.0.1", 80, &handler);
+	auto manager = new ListeningConnectionManager("127.0.0.1", 80, &handler, &delegateThatDropsPrivileges);
 	manager.listen();
+	---
+
+	The 4th parameter is optional.
 
 	I suggest you use BufferedInputRange(connection) to handle the input. As a packet
 	comes in, you will get control. You can just continue; though to fetch more.
@@ -4788,13 +5499,75 @@ class ListeningConnectionManager {
 	ubyte nextIndexBack;
 	shared(int) queueLength;
 
+	Socket acceptCancelable() {
+		version(Posix) {
+			import core.sys.posix.sys.select;
+			fd_set read_fds;
+			FD_ZERO(&read_fds);
+			FD_SET(listener.handle, &read_fds);
+			if(cancelfd != -1)
+				FD_SET(cancelfd, &read_fds);
+			auto max = listener.handle > cancelfd ? listener.handle : cancelfd;
+			auto ret = select(max + 1, &read_fds, null, null, null);
+			if(ret == -1) {
+				import core.stdc.errno;
+				if(errno == EINTR)
+					return null;
+				else
+					throw new Exception("wtf select");
+			}
+
+			if(cancelfd != -1 && FD_ISSET(cancelfd, &read_fds)) {
+				return null;
+			}
+
+			if(FD_ISSET(listener.handle, &read_fds))
+				return listener.accept();
+
+			return null;
+		} else {
+
+			Socket socket = listener;
+
+			auto check = new SocketSet();
+
+			keep_looping:
+			check.reset();
+			check.add(socket);
+
+			// just to check the stop flag on a kinda busy loop. i hate this FIXME
+			auto got = Socket.select(check, null, null, 3.seconds);
+			if(got > 0)
+				return listener.accept();
+			if(globalStopFlag)
+				return null;
+			else
+				goto keep_looping;
+		}
+	}
+
+	int defaultNumberOfThreads() {
+		import std.parallelism;
+		version(cgi_use_fiber) {
+			return totalCPUs * 1 + 1;
+		} else {
+			// I times 4 here because there's a good chance some will be blocked on i/o.
+			return totalCPUs * 4;
+		}
+
+	}
+
 	void listen() {
-		running = true;
 		shared(int) loopBroken;
 
 		version(Posix) {
 			import core.sys.posix.signal;
 			signal(SIGPIPE, SIG_IGN);
+		}
+
+		version(linux) {
+			if(cancelfd == -1)
+				cancelfd = eventfd(0, 0);
 		}
 
 		version(cgi_no_threads) {
@@ -4803,8 +5576,9 @@ class ListeningConnectionManager {
 
 			// the thread mode is faster and less likely to stall the whole
 			// thing when a request is slow
-			while(!loopBroken && running) {
-				auto sn = listener.accept();
+			while(!loopBroken && !globalStopFlag) {
+				auto sn = acceptCancelable();
+				if(sn is null) continue;
 				cloexec(sn);
 				try {
 					handler(sn);
@@ -4814,30 +5588,21 @@ class ListeningConnectionManager {
 				}
 			}
 		} else {
-			import std.parallelism;
 
-			version(cgi_use_fork) {
-				//asm { int 3; }
-				fork();
+			if(useFork) {
+				version(linux) {
+					//asm { int 3; }
+					fork();
+				}
 			}
 
 			version(cgi_use_fiber) {
-				import core.sys.linux.epoll;
-				epfd = epoll_create1(EPOLL_CLOEXEC);
-				if(epfd == -1)
-					throw new Exception("epoll_create1 " ~ to!string(errno));
-				scope(exit) {
-					import core.sys.posix.unistd;
-					close(epfd);
+
+				version(Windows) {
+					listener.accept();
 				}
 
-				epoll_event ev;
-				ev.events = EPOLLIN | EPOLLEXCLUSIVE; // EPOLLEXCLUSIVE is only available on kernels since like 2017 but that's prolly good enough.
-				ev.data.fd = listener.handle;
-				if(epoll_ctl(epfd, EPOLL_CTL_ADD, listener.handle, &ev) == -1)
-					throw new Exception("epoll_ctl " ~ to!string(errno));
-
-				WorkerThread[] threads = new WorkerThread[](totalCPUs * 1 + 1);
+				WorkerThread[] threads = new WorkerThread[](numberOfThreads);
 				foreach(i, ref thread; threads) {
 					thread = new WorkerThread(this, handler, cast(int) i);
 					thread.start();
@@ -4855,7 +5620,7 @@ class ListeningConnectionManager {
 				}
 
 
-				while(running) {
+				while(!globalStopFlag) {
 					Thread.sleep(1.seconds);
 					if(fiber_crash_check())
 						break;
@@ -4864,64 +5629,71 @@ class ListeningConnectionManager {
 			} else {
 				semaphore = new Semaphore();
 
-				// I times 4 here because there's a good chance some will be blocked on i/o.
-				ConnectionThread[] threads = new ConnectionThread[](totalCPUs * 4);
+				ConnectionThread[] threads = new ConnectionThread[](numberOfThreads);
 				foreach(i, ref thread; threads) {
 					thread = new ConnectionThread(this, handler, cast(int) i);
 					thread.start();
 				}
-			}
 
-			while(!loopBroken && running) {
-				Socket sn;
+				while(!loopBroken && !globalStopFlag) {
+					Socket sn;
 
-				bool crash_check() {
-					bool hasAnyRunning;
-					foreach(thread; threads) {
-						if(!thread.isRunning) {
-							thread.join();
-						} else hasAnyRunning = true;
+					bool crash_check() {
+						bool hasAnyRunning;
+						foreach(thread; threads) {
+							if(!thread.isRunning) {
+								thread.join();
+							} else hasAnyRunning = true;
+						}
+
+						return (!hasAnyRunning);
 					}
 
-					return (!hasAnyRunning);
+
+					void accept_new_connection() {
+						sn = acceptCancelable();
+						if(sn is null) return;
+						cloexec(sn);
+						if(tcp) {
+							// disable Nagle's algorithm to avoid a 40ms delay when we send/recv
+							// on the socket because we do some buffering internally. I think this helps,
+							// certainly does for small requests, and I think it does for larger ones too
+							sn.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+
+							sn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"seconds"(10));
+						}
+					}
+
+					void existing_connection_new_data() {
+						// wait until a slot opens up
+						//int waited = 0;
+						while(queueLength >= queue.length) {
+							Thread.sleep(1.msecs);
+							//waited ++;
+						}
+						//if(waited) {import std.stdio; writeln(waited);}
+						synchronized(this) {
+							queue[nextIndexBack] = sn;
+							nextIndexBack++;
+							atomicOp!"+="(queueLength, 1);
+						}
+						semaphore.notify();
+					}
+
+
+					accept_new_connection();
+					if(sn !is null)
+						existing_connection_new_data();
+					else if(sn is null && globalStopFlag) {
+						foreach(thread; threads) {
+							semaphore.notify();
+						}
+						Thread.sleep(50.msecs);
+					}
+
+					if(crash_check())
+						break;
 				}
-
-
-				void accept_new_connection() {
-					sn = listener.accept();
-					cloexec(sn);
-					if(tcp) {
-						// disable Nagle's algorithm to avoid a 40ms delay when we send/recv
-						// on the socket because we do some buffering internally. I think this helps,
-						// certainly does for small requests, and I think it does for larger ones too
-						sn.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-
-						sn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"seconds"(10));
-					}
-				}
-
-				void existing_connection_new_data() {
-					// wait until a slot opens up
-					//int waited = 0;
-					while(queueLength >= queue.length) {
-						Thread.sleep(1.msecs);
-						//waited ++;
-					}
-					//if(waited) {import std.stdio; writeln(waited);}
-					synchronized(this) {
-						queue[nextIndexBack] = sn;
-						nextIndexBack++;
-						atomicOp!"+="(queueLength, 1);
-					}
-					semaphore.notify();
-				}
-
-
-				accept_new_connection();
-				existing_connection_new_data();
-
-				if(crash_check())
-					break;
 			}
 
 			// FIXME: i typically stop this with ctrl+c which never
@@ -4941,17 +5713,20 @@ class ListeningConnectionManager {
 	private void dg_handler(Socket s) {
 		fhandler(s);
 	}
-	this(string host, ushort port, void function(Socket) handler) {
+	this(string host, ushort port, void function(Socket) handler, void delegate() dropPrivs = null, bool useFork = cgi_use_fork_default, int numberOfThreads = 0) {
 		fhandler = handler;
-		this(host, port, &dg_handler);
+		this(host, port, &dg_handler, dropPrivs, useFork, numberOfThreads);
 	}
 
-	this(string host, ushort port, void delegate(Socket) handler) {
+	this(string host, ushort port, void delegate(Socket) handler, void delegate() dropPrivs = null, bool useFork = cgi_use_fork_default, int numberOfThreads = 0) {
 		this.handler = handler;
+		this.useFork = useFork;
+		this.numberOfThreads = numberOfThreads ? numberOfThreads : defaultNumberOfThreads();
 
-		listener = startListening(host, port, tcp, cleanup, 128);
+		listener = startListening(host, port, tcp, cleanup, 128, dropPrivs);
 
-		version(cgi_use_fiber) version(cgi_use_fork)
+		version(cgi_use_fiber)
+		if(useFork)
 			listener.blocking = false;
 
 		// this is the UI control thread and thus gets more priority
@@ -4961,13 +5736,11 @@ class ListeningConnectionManager {
 	Socket listener;
 	void delegate(Socket) handler;
 
-	bool running;
-	void quit() {
-		running = false;
-	}
+	immutable bool useFork;
+	int numberOfThreads;
 }
 
-Socket startListening(string host, ushort port, ref bool tcp, ref void delegate() cleanup, int backQueue) {
+Socket startListening(string host, ushort port, ref bool tcp, ref void delegate() cleanup, int backQueue, void delegate() dropPrivs) {
 	Socket listener;
 	if(host.startsWith("unix:")) {
 		version(Posix) {
@@ -4996,7 +5769,14 @@ Socket startListening(string host, ushort port, ref bool tcp, ref void delegate(
 			throw new Exception("abstract unix sockets not supported on this system");
 		}
 	} else {
-		listener = new TcpSocket();
+		version(cgi_use_fiber) {
+			version(Windows)
+				listener = new PseudoblockingOverlappedSocket(AddressFamily.INET, SocketType.STREAM);
+			else
+				listener = new TcpSocket();
+		} else {
+			listener = new TcpSocket();
+		}
 		cloexec(listener);
 		listener.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
 		listener.bind(host.length ? parseAddress(host, port) : new InternetAddress(port));
@@ -5008,7 +5788,8 @@ Socket startListening(string host, ushort port, ref bool tcp, ref void delegate(
 
 	listener.listen(backQueue);
 
-	dropPrivs();
+	if (dropPrivs !is null) // can be null, backwards compatibility
+		dropPrivs();
 
 	return listener;
 }
@@ -5031,6 +5812,7 @@ void sendAll(Socket s, const(void)[] data, string file = __FILE__, size_t line =
 			throw new ConnectionException(s, lastSocketError, file, line);
 		}
 		assert(amount > 0);
+
 		data = data[amount .. $];
 	} while(data.length);
 }
@@ -5102,6 +5884,8 @@ class ConnectionThread : Thread {
 			// so if there's a bunch of idle keep-alive connections, it can
 			// consume all the worker threads... just sitting there.
 			lcm.semaphore.wait();
+			if(globalStopFlag)
+				return;
 			Socket socket;
 			synchronized(lcm) {
 				auto idx = lcm.nextIndexFront;
@@ -5163,8 +5947,69 @@ class WorkerThread : Thread {
 		super(&run);
 	}
 
+	version(Windows)
 	void run() {
-		while(lcm.running) {
+		auto timeout = INFINITE;
+		PseudoblockingOverlappedSocket key;
+		OVERLAPPED* overlapped;
+		DWORD bytes;
+		while(!globalStopFlag && GetQueuedCompletionStatus(iocp, &bytes, cast(PULONG_PTR) &key, &overlapped, timeout)) {
+			if(key is null)
+				continue;
+			key.lastAnswer = bytes;
+			if(key.fiber) {
+				key.fiber.proceed();
+			} else {
+				// we have a new connection, issue the first receive on it and issue the next accept
+
+				auto sn = key.accepted;
+
+				key.accept();
+
+				cloexec(sn);
+				if(lcm.tcp) {
+					// disable Nagle's algorithm to avoid a 40ms delay when we send/recv
+					// on the socket because we do some buffering internally. I think this helps,
+					// certainly does for small requests, and I think it does for larger ones too
+					sn.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+
+					sn.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"seconds"(10));
+				}
+
+				dg(sn);
+			}
+		}
+		//SleepEx(INFINITE, TRUE);
+	}
+
+	version(linux)
+	void run() {
+
+		import core.sys.linux.epoll;
+		epfd = epoll_create1(EPOLL_CLOEXEC);
+		if(epfd == -1)
+			throw new Exception("epoll_create1 " ~ to!string(errno));
+		scope(exit) {
+			import core.sys.posix.unistd;
+			close(epfd);
+		}
+
+		{
+			epoll_event ev;
+			ev.events = EPOLLIN;
+			ev.data.fd = cancelfd;
+			epoll_ctl(epfd, EPOLL_CTL_ADD, cancelfd, &ev);
+		}
+
+		epoll_event ev;
+		ev.events = EPOLLIN | EPOLLEXCLUSIVE; // EPOLLEXCLUSIVE is only available on kernels since like 2017 but that's prolly good enough.
+		ev.data.fd = lcm.listener.handle;
+		if(epoll_ctl(epfd, EPOLL_CTL_ADD, lcm.listener.handle, &ev) == -1)
+			throw new Exception("epoll_ctl " ~ to!string(errno));
+
+
+
+		while(!globalStopFlag) {
 			Socket sn;
 
 			epoll_event[64] events;
@@ -5178,18 +6023,19 @@ class WorkerThread : Thread {
 			foreach(idx; 0 .. nfds) {
 				auto flags = events[idx].events;
 
-				if(cast(size_t) events[idx].data.ptr == cast(size_t) lcm.listener.handle) {
+				if(cast(size_t) events[idx].data.ptr == cast(size_t) cancelfd) {
+					globalStopFlag = true;
+					//import std.stdio; writeln("exit heard");
+					break;
+				} else if(cast(size_t) events[idx].data.ptr == cast(size_t) lcm.listener.handle) {
+					//import std.stdio; writeln(myThreadNumber, " woken up ", flags);
 					// this try/catch is because it is set to non-blocking mode
 					// and Phobos' stupid api throws an exception instead of returning
 					// if it would block. Why would it block? because a forked process
 					// might have beat us to it, but the wakeup event thundered our herds.
-					version(cgi_use_fork) {
 						try
-						sn = lcm.listener.accept();
+						sn = lcm.listener.accept(); // don't need to do the acceptCancelable here since the epoll checks it better
 						catch(SocketAcceptException e) { continue; }
-					} else {
-						sn = lcm.listener.accept();
-					}
 
 					cloexec(sn);
 					if(lcm.tcp) {
@@ -5203,6 +6049,9 @@ class WorkerThread : Thread {
 
 					dg(sn);
 				} else {
+					if(cast(size_t) events[idx].data.ptr < 1024) {
+						throw new Exception("this doesn't look like a fiber pointer...");
+					}
 					auto fiber = cast(CgiFiber) events[idx].data.ptr;
 					fiber.proceed();
 				}
@@ -5430,7 +6279,7 @@ ByChunkRange byChunk(BufferedInputRange ir, size_t atMost) {
 }
 
 version(cgi_with_websocket) {
-	// http://tools.ietf.org/html/rfc6455
+	// https://tools.ietf.org/html/rfc6455
 
 	/**
 		WEBSOCKET SUPPORT:
@@ -5610,7 +6459,7 @@ version(cgi_with_websocket) {
 			WebSocketFrame wss;
 			wss.fin = true;
 			wss.opcode = WebSocketOpcode.close;
-			wss.data = cast(ubyte[]) reason;
+			wss.data = cast(ubyte[]) reason.dup;
 			wss.send(&llsend);
 
 			readyState_ = CLOSING;
@@ -5645,7 +6494,7 @@ version(cgi_with_websocket) {
 			WebSocketFrame wss;
 			wss.fin = true;
 			wss.opcode = WebSocketOpcode.text;
-			wss.data = cast(ubyte[]) textData;
+			wss.data = cast(ubyte[]) textData.dup;
 			wss.send(&llsend);
 		}
 
@@ -5657,7 +6506,7 @@ version(cgi_with_websocket) {
 			WebSocketFrame wss;
 			wss.fin = true;
 			wss.opcode = WebSocketOpcode.binary;
-			wss.data = cast(ubyte[]) binaryData;
+			wss.data = cast(ubyte[]) binaryData.dup;
 			wss.send(&llsend);
 		}
 
@@ -5895,7 +6744,7 @@ version(cgi_with_websocket) {
 			WebSocketFrame msg;
 			msg.fin = true;
 			msg.opcode = opcode;
-			msg.data = cast(ubyte[]) data;
+			msg.data = cast(ubyte[]) data.dup;
 
 			return msg;
 		}
@@ -6028,7 +6877,7 @@ version(cgi_with_websocket) {
 				if(d.length < 8) return needsMoreData();
 
 				foreach(i; 0 .. 8) {
-					msg.realLength |= d[0] << ((7-i) * 8);
+					msg.realLength |= ulong(d[0]) << ((7-i) * 8);
 					d = d[1 .. $];
 				}
 			} else {
@@ -6090,8 +6939,8 @@ version(Windows)
 }
 
 version(Posix) {
+	import core.sys.posix.unistd;
 	version(CRuntime_Musl) {} else {
-		import core.sys.posix.unistd;
 		private extern(C) int posix_spawn(pid_t*, const char*, void*, void*, const char**, const char**);
 	}
 }
@@ -6365,11 +7214,14 @@ void freeIoOp(ref IoOp* ptr) {
 version(Posix)
 version(with_addon_servers_connections)
 void nonBlockingWrite(EventIoServer eis, int connection, const void[] data) {
+
+	//import std.stdio : writeln; writeln(cast(string) data);
+
 	import core.sys.posix.unistd;
 
 	auto ret = write(connection, data.ptr, data.length);
 	if(ret != data.length) {
-		if(ret == 0 || errno == EPIPE) {
+		if(ret == 0 || (ret == -1 && (errno == EPIPE || errno == ETIMEDOUT))) {
 			// the file is closed, remove it
 			eis.fileClosed(connection);
 		} else
@@ -6404,7 +7256,7 @@ https://docs.microsoft.com/en-us/windows/desktop/api/winsock2/nf-winsock2-wsaget
 	You can customize your server by subclassing the appropriate server. Then, register your
 	subclass at compile time with the [registerEventIoServer] template, or implement your own
 	main function and call it yourself.
-	
+
 	$(TIP If you make your subclass a `final class`, there is a slight performance improvement.)
 +/
 version(with_addon_servers_connections)
@@ -6419,7 +7271,7 @@ interface EventIoServer {
 }
 
 // the sink should buffer it
-private void serialize(T)(scope void delegate(ubyte[]) sink, T t) {
+private void serialize(T)(scope void delegate(scope ubyte[]) sink, T t) {
 	static if(is(T == struct)) {
 		foreach(member; __traits(allMembers, T))
 			serialize(sink, __traits(getMember, t, member));
@@ -6441,7 +7293,7 @@ private void serialize(T)(scope void delegate(ubyte[]) sink, T t) {
 	} else static assert(0, T.stringof);
 }
 
-// all may be stack buffers, so use cautio
+// all may be stack buffers, so use caution
 private void deserialize(T)(scope ubyte[] delegate(int sz) get, scope void delegate(T) dg) {
 	static if(is(T == struct)) {
 		T t;
@@ -6566,7 +7418,7 @@ mixin template ImplementRpcClientInterface(T, string serverPath, string cmdArg) 
 
 	// derivedMembers on an interface seems to give exactly what I want: the virtual functions we need to implement. so I am just going to use it directly without more filtering.
 	static foreach(idx, member; __traits(derivedMembers, T)) {
-	static if(__traits(isVirtualFunction, __traits(getMember, T, member)))
+	static if(__traits(isVirtualMethod, __traits(getMember, T, member)))
 		mixin( q{
 		std.traits.ReturnType!(__traits(getMember, T, member))
 		} ~ member ~ q{(std.traits.Parameters!(__traits(getMember, T, member)) params)
@@ -6601,9 +7453,9 @@ mixin template ImplementRpcClientInterface(T, string serverPath, string cmdArg) 
 
 					int dataLocation;
 					ubyte[] grab(int sz) {
-						auto d = got[dataLocation .. dataLocation + sz];
+						auto dataLocation1 = dataLocation;
 						dataLocation += sz;
-						return d;
+						return got[dataLocation1 .. dataLocation];
 					}
 
 					typeof(return) retu;
@@ -6659,7 +7511,7 @@ void dispatchRpcServer(Interface, Class)(Class this_, ubyte[] data, int fd) if(i
 
 	sw: switch(calledIdx) {
 		foreach(idx, memberName; __traits(derivedMembers, Interface))
-		static if(__traits(isVirtualFunction, __traits(getMember, Interface, memberName))) {
+		static if(__traits(isVirtualMethod, __traits(getMember, Interface, memberName))) {
 			case idx:
 				assert(calledFunction == __traits(getMember, Interface, memberName).mangleof);
 
@@ -6813,7 +7665,7 @@ interface Session(Data) : SessionObject {
 /++
 	An implementation of [Session] that works on real cgi connections utilizing the
 	[BasicDataServer].
-	
+
 	As opposed to a [MockSession] which is made for testing purposes.
 
 	You will not construct one of these directly. See [Cgi.getSessionObject] instead.
@@ -7395,7 +8247,9 @@ final class EventSourceServerImplementation : EventSourceServer, EventIoServer {
 		}
 		return false;
 	}
-	void handleLocalConnectionClose(IoOp* op) {}
+	void handleLocalConnectionClose(IoOp* op) {
+		fileClosed(op.fd);
+	}
 	void handleLocalConnectionComplete(IoOp* op) {}
 
 	void wait_timeout() {
@@ -7403,9 +8257,9 @@ final class EventSourceServerImplementation : EventSourceServer, EventIoServer {
 		foreach(url, connections; eventConnectionsByUrl)
 		foreach(connection; connections)
 			if(connection.needsChunking)
-				nonBlockingWrite(this, connection.fd, "2\r\n:\n");
+				nonBlockingWrite(this, connection.fd, "1b\r\nevent: keepalive\ndata: ok\n\n\r\n");
 			else
-				nonBlockingWrite(this, connection.fd, ":\n");
+				nonBlockingWrite(this, connection.fd, "event: keepalive\ndata: ok\n\n\r\n");
 	}
 
 	void fileClosed(int fd) {
@@ -7467,7 +8321,7 @@ final class EventSourceServerImplementation : EventSourceServer, EventIoServer {
 		int typeLength;
 		char[32] typeBuffer = 0;
 		int messageLength;
-		char[2048] messageBuffer = 0;
+		char[2048 * 4] messageBuffer = 0; // this is an arbitrary limit, it needs to fit comfortably in stack (including in a fiber) and be a single send on the kernel side cuz of the impl... i think this is ok for a unix socket.
 		int _lifetime;
 
 		char[] message() return {
@@ -7571,18 +8425,21 @@ final class EventSourceServerImplementation : EventSourceServer, EventIoServer {
 		auto len = toHex(formattedMessage.length);
 		buffer[4 .. 6] = "\r\n"[];
 		buffer[4 - len.length .. 4] = len[];
+		buffer[6 + formattedMessage.length] = '\r';
+		buffer[6 + formattedMessage.length + 1] = '\n';
 
-		auto chunkedMessage = buffer[4 - len.length .. 6 + formattedMessage.length];
+		auto chunkedMessage = buffer[4 - len.length .. 6 + formattedMessage.length +2];
 		// done
 
 		// FIXME: send back requests when needed
 		// FIXME: send a single ":\n" every 15 seconds to keep alive
 
 		foreach(connection; connections) {
-			if(connection.needsChunking)
+			if(connection.needsChunking) {
 				nonBlockingWrite(this, connection.fd, chunkedMessage);
-			else
+			} else {
 				nonBlockingWrite(this, connection.fd, formattedMessage);
+			}
 		}
 	}
 }
@@ -7668,11 +8525,20 @@ void runAddonServer(EIS)(string localListenerName, EIS eis) if(is(EIS : EventIoS
 			ioops[sock] = acceptOp;
 		}
 
+		import core.time : MonoTime, seconds;
+
+		MonoTime timeout = MonoTime.currTime + 15.seconds;
+
 		while(true) {
 
 			// FIXME: it should actually do a timerfd that runs on any thing that hasn't been run recently
 
-			int timeout_milliseconds = 15000; //  -1; // infinite
+			int timeout_milliseconds = 0; //  -1; // infinite
+
+			timeout_milliseconds = cast(int) (timeout - MonoTime.currTime).total!"msecs";
+			if(timeout_milliseconds < 0)
+				timeout_milliseconds = 0;
+
 			//writeln("waiting for ", name);
 
 			version(linux) {
@@ -7689,6 +8555,7 @@ void runAddonServer(EIS)(string localListenerName, EIS eis) if(is(EIS : EventIoS
 
 			if(nfds == 0) {
 				eis.wait_timeout();
+				timeout += 15.seconds;
 			}
 
 			foreach(idx; 0 .. nfds) {
@@ -7727,7 +8594,7 @@ void runAddonServer(EIS)(string localListenerName, EIS eis) if(is(EIS : EventIoS
 						cloexec(ns);
 
 						makeNonBlocking(ns);
-						auto niop = allocateIoOp(ns, IoOp.ReadSocketHandle, 4096, &eis.handleLocalConnectionData);
+						auto niop = allocateIoOp(ns, IoOp.ReadSocketHandle, 4096 * 4, &eis.handleLocalConnectionData);
 						niop.closeHandler = &eis.handleLocalConnectionClose;
 						niop.completeHandler = &eis.handleLocalConnectionComplete;
 						scope(failure) freeIoOp(niop);
@@ -7847,8 +8714,7 @@ ssize_t write_fd(int fd, void *ptr, size_t nbytes, int sendfd) {
 	iovec[1] iov;
 
 	version(OSX) {
-		//msg.msg_accrights = cast(cattr_t) &sendfd;
-		//msg.msg_accrightslen = int.sizeof;
+		// removed
 	} else version(Android) {
 	} else {
 		union ControlUnion {
@@ -8056,6 +8922,25 @@ class MissingArgumentException : Exception {
 }
 
 /++
+	You can throw this from an api handler to indicate a 404 response. This is done by the presentExceptionAsHtml function in the presenter.
+
+	History:
+		Added December 15, 2021 (dub v10.5)
++/
+class ResourceNotFoundException : Exception {
+	string resourceType;
+	string resourceId;
+
+	this(string resourceType, string resourceId, string file = __FILE__, size_t line = __LINE__, Throwable next = null) {
+		this.resourceType = resourceType;
+		this.resourceId = resourceId;
+
+		super("Resource not found: " ~ resourceType ~ " " ~ resourceId, file, line, next);
+	}
+
+}
+
+/++
 	This can be attached to any constructor or function called from the cgi system.
 
 	If it is present, the function argument can NOT be set from web params, but instead
@@ -8212,6 +9097,9 @@ auto callFromCgi(alias method, T)(T dg, Cgi cgi) {
 			}
 
 			return false;
+		} else static if(is(T == enum)) {
+			*what = to!T(value);
+			return true;
 		} else static if(isSomeString!T || isIntegral!T || isFloatingPoint!T) {
 			*what = to!T(value);
 			return true;
@@ -8368,6 +9256,74 @@ private bool hasIfCalledFromWeb(attrs...)() {
 +/
 template AutomaticForm(alias customizer) { }
 
+/++
+	This is meant to be returned by a function that takes a form POST submission. You
+	want to set the url of the new resource it created, which is set as the http
+	Location header for a "201 Created" result, and you can also set a separate
+	destination for browser users, which it sets via a "Refresh" header.
+
+	The `resourceRepresentation` should generally be the thing you just created, and
+	it will be the body of the http response when formatted through the presenter.
+	The exact thing is up to you - it could just return an id, or the whole object, or
+	perhaps a partial object.
+
+	Examples:
+	---
+	class Test : WebObject {
+		@(Cgi.RequestMethod.POST)
+		CreatedResource!int makeThing(string value) {
+			return CreatedResource!int(value.to!int, "/resources/id");
+		}
+	}
+	---
+
+	History:
+		Added December 18, 2021
++/
+struct CreatedResource(T) {
+	static if(!is(T == void))
+		T resourceRepresentation;
+	string resourceUrl;
+	string refreshUrl;
+}
+
+/+
+/++
+	This can be attached as a UDA to a handler to add a http Refresh header on a
+	successful run. (It will not be attached if the function throws an exception.)
+	This will refresh the browser the given number of seconds after the page loads,
+	to the url returned by `urlFunc`, which can be either a static function or a
+	member method of the current handler object.
+
+	You might use this for a POST handler that is normally used from ajax, but you
+	want it to degrade gracefully to a temporarily flashed message before reloading
+	the main page.
+
+	History:
+		Added December 18, 2021
++/
+struct Refresh(alias urlFunc) {
+	int waitInSeconds;
+
+	string url() {
+		static if(__traits(isStaticFunction, urlFunc))
+			return urlFunc();
+		else static if(is(urlFunc : string))
+			return urlFunc;
+	}
+}
++/
+
+/+
+/++
+	Sets a filter to be run before
+
+	A before function can do validations of params and log and stop the function from running.
++/
+template Before(alias b) {}
+template After(alias b) {}
++/
+
 /+
 	Argument conversions: for the most part, it is to!Thing(string).
 
@@ -8469,8 +9425,8 @@ class WebPresenter(CRTP) {
 			:root {
 				--mild-border: #ccc;
 				--middle-border: #999;
-				--accent-color: #e8e8e8;
-				--sidebar-color: #f2f2f2;
+				--accent-color: #f2f2f2;
+				--sidebar-color: #fefefe;
 			}
 		` ~ genericFormStyling() ~ genericSiteStyling();
 	}
@@ -8568,8 +9524,10 @@ css";
 	Element htmlContainer() {
 		auto document = new Document(q"html
 <!DOCTYPE html>
-<html>
+<html class="no-script">
 <head>
+	<script>document.documentElement.classList.remove("no-script");</script>
+	<style>.no-script requires-script { display: none; }</style>
 	<title>D Application</title>
 	<link rel="stylesheet" href="style.css" />
 </head>
@@ -8602,8 +9560,33 @@ html", true, true);
 	}
 
 	void presentSuccessfulReturn(T, Meta)(Cgi cgi, T ret, Meta meta, string format) {
-		// FIXME? format?
-		(cast(CRTP) this).presentSuccessfulReturnAsHtml(cgi, ret, meta);
+		switch(format) {
+			case "html":
+				(cast(CRTP) this).presentSuccessfulReturnAsHtml(cgi, ret, meta);
+			break;
+			case "json":
+				import arsd.jsvar;
+				static if(is(typeof(ret) == MultipleResponses!Types, Types...)) {
+					var json;
+					foreach(index, type; Types) {
+						if(ret.contains == index)
+							json = ret.payload[index];
+					}
+				} else {
+					var json = ret;
+				}
+				var envelope = json; // var.emptyObject;
+				/*
+				envelope.success = true;
+				envelope.result = json;
+				envelope.error = null;
+				*/
+				cgi.setResponseContentType("application/json");
+				cgi.write(envelope.toJson(), true);
+			break;
+			default:
+				cgi.setResponseStatus("406 Not Acceptable"); // not exactly but sort of.
+		}
 	}
 
 	/// typeof(null) (which is also used to represent functions returning `void`) do nothing
@@ -8616,6 +9599,17 @@ html", true, true);
 	/// Redirections are forwarded to [Cgi.setResponseLocation]
 	void presentSuccessfulReturn(T : Redirection, Meta)(Cgi cgi, T ret, Meta meta, string format) {
 		cgi.setResponseLocation(ret.to, true, getHttpCodeText(ret.code));
+	}
+
+	/// [CreatedResource]s send code 201 and will set the given urls, then present the given representation.
+	void presentSuccessfulReturn(T : CreatedResource!R, Meta, R)(Cgi cgi, T ret, Meta meta, string format) {
+		cgi.setResponseStatus(getHttpCodeText(201));
+		if(ret.resourceUrl.length)
+			cgi.header("Location: " ~ ret.resourceUrl);
+		if(ret.refreshUrl.length)
+			cgi.header("Refresh: 0;" ~ ret.refreshUrl);
+		static if(!is(R == void))
+			presentSuccessfulReturn(cgi, ret.resourceRepresentation, meta, format);
 	}
 
 	/// Multiple responses deconstruct the algebraic type and forward to the appropriate handler at runtime
@@ -8632,9 +9626,14 @@ html", true, true);
 			assert(0);
 	}
 
-	/// An instance of the [arsd.dom.FileResource] interface has its own content type; assume it is a download of some sort.
+	/++
+		An instance of the [arsd.dom.FileResource] interface has its own content type; assume it is a download of some sort if the filename member is non-null of the FileResource interface.
+	+/
 	void presentSuccessfulReturn(T : FileResource, Meta)(Cgi cgi, T ret, Meta meta, string format) {
 		cgi.setCache(true); // not necessarily true but meh
+		if(auto fn = ret.filename()) {
+			cgi.header("Content-Disposition: attachment; filename="~fn~";");
+		}
 		cgi.setResponseContentType(ret.contentType);
 		cgi.write(ret.getData(), true);
 	}
@@ -8647,6 +9646,21 @@ html", true, true);
 	}
 
 	/++
+
+		History:
+			Added January 23, 2023 (dub v11.0)
+	+/
+	void presentExceptionalReturn(Meta)(Cgi cgi, Throwable t, Meta meta, string format) {
+		switch(format) {
+			case "html":
+				presentExceptionAsHtml(cgi, t, meta);
+			break;
+			default:
+		}
+	}
+
+
+	/++
 		If you override this, you will need to cast the exception type `t` dynamically,
 		but can then use the template arguments here to refer back to the function.
 
@@ -8654,13 +9668,44 @@ html", true, true);
 		method on the live object. You could, in theory, change arguments and retry, but I
 		provide that information mostly with the expectation that you will use them to make
 		useful forms or richer error messages for the user.
+
+		History:
+			BREAKING CHANGE on January 23, 2023 (v11.0 ): it previously took an `alias func` and `T dg` to call the function again.
+			I removed this in favor of a `Meta` param.
+
+			Before: `void presentExceptionAsHtml(alias func, T)(Cgi cgi, Throwable t, T dg)`
+
+			After: `void presentExceptionAsHtml(Meta)(Cgi cgi, Throwable t, Meta meta)`
+
+			If you used the func for something, move that something into your `methodMeta` template.
+
+			What is the benefit of this change? Somewhat smaller executables and faster builds thanks to more reused functions, together with
+			enabling an easier implementation of [presentExceptionalReturn].
 	+/
-	void presentExceptionAsHtml(alias func, T)(Cgi cgi, Throwable t, T dg) {
-		presentExceptionAsHtmlImpl(cgi, t, createAutomaticFormForFunction!(func)(dg));
+	void presentExceptionAsHtml(Meta)(Cgi cgi, Throwable t, Meta meta) {
+		Form af;
+		/+
+		foreach(attr; __traits(getAttributes, func)) {
+			static if(__traits(isSame, attr, AutomaticForm)) {
+				af = createAutomaticFormForFunction!(func)(dg);
+			}
+		}
+		+/
+		presentExceptionAsHtmlImpl(cgi, t, af);
 	}
 
 	void presentExceptionAsHtmlImpl(Cgi cgi, Throwable t, Form automaticForm) {
-		if(auto mae = cast(MissingArgumentException) t) {
+		if(auto e = cast(ResourceNotFoundException) t) {
+			auto container = this.htmlContainer();
+
+			container.addChild("p", e.msg);
+
+			if(!cgi.outputtedResponseData)
+				cgi.setResponseStatus("404 Not Found");
+			cgi.write(container.parentDocument.toString(), true);
+		} else if(auto mae = cast(MissingArgumentException) t) {
+			if(automaticForm is null)
+				goto generic;
 			auto container = this.htmlContainer();
 			if(cgi.requestMethod == Cgi.RequestMethod.POST)
 				container.appendChild(Element.make("p", "Argument `" ~ mae.argumentName ~ "` of type `" ~ mae.argumentType ~ "` is missing"));
@@ -8668,6 +9713,7 @@ html", true, true);
 
 			cgi.write(container.parentDocument.toString(), true);
 		} else {
+			generic:
 			auto container = this.htmlContainer();
 
 			// import std.stdio; writeln(t.toString());
@@ -8729,7 +9775,7 @@ html", true, true);
 	/++
 		Returns an element for a particular type
 	+/
-	Element elementFor(T)(string displayName, string name) {
+	Element elementFor(T)(string displayName, string name, Element function() udaSuggestion) {
 		import std.traits;
 
 		auto div = Element.make("div");
@@ -8747,6 +9793,21 @@ html", true, true);
 			auto i = lbl.addChild("input", name);
 			i.attrs.name = name;
 			i.attrs.type = "file";
+		} else static if(is(T == enum)) {
+			Element lbl;
+			if(displayName !is null) {
+				lbl = div.addChild("label");
+				lbl.addChild("span", displayName, "label-text");
+				lbl.appendText(" ");
+			} else {
+				lbl = div;
+			}
+			auto i = lbl.addChild("select", name);
+			i.attrs.name = name;
+
+			foreach(memberName; __traits(allMembers, T))
+				i.addChild("option", memberName);
+
 		} else static if(is(T == struct)) {
 			if(displayName !is null)
 				div.addChild("span", displayName, "label-text");
@@ -8755,7 +9816,7 @@ html", true, true);
 			fieldset.addChild("input", name);
 			foreach(idx, memberName; __traits(allMembers, T))
 			static if(__traits(compiles, __traits(getMember, T, memberName).offsetof)) {
-				fieldset.appendChild(elementFor!(typeof(__traits(getMember, T, memberName)))(beautify(memberName), name ~ "." ~ memberName));
+				fieldset.appendChild(elementFor!(typeof(__traits(getMember, T, memberName)))(beautify(memberName), name ~ "." ~ memberName, null /* FIXME: pull off the UDA */));
 			}
 		} else static if(isSomeString!T || isIntegral!T || isFloatingPoint!T) {
 			Element lbl;
@@ -8766,13 +9827,22 @@ html", true, true);
 			} else {
 				lbl = div;
 			}
-			auto i = lbl.addChild("input", name);
+			Element i;
+			if(udaSuggestion) {
+				i = udaSuggestion();
+				lbl.appendChild(i);
+			} else {
+				i = lbl.addChild("input", name);
+			}
 			i.attrs.name = name;
 			static if(isSomeString!T)
 				i.attrs.type = "text";
 			else
 				i.attrs.type = "number";
-			i.attrs.value = to!string(T.init);
+			if(i.tagName == "textarea")
+				i.textContent = to!string(T.init);
+			else
+				i.attrs.value = to!string(T.init);
 		} else static if(is(T == bool)) {
 			Element lbl;
 			if(displayName !is null) {
@@ -8786,21 +9856,9 @@ html", true, true);
 			i.attrs.type = "checkbox";
 			i.attrs.value = "true";
 			i.attrs.name = name;
-		} else static if(is(T == Cgi.UploadedFile)) {
-			Element lbl;
-			if(displayName !is null) {
-				lbl = div.addChild("label");
-				lbl.addChild("span", displayName, "label-text");
-				lbl.appendText(" ");
-			} else {
-				lbl = div;
-			}
-			auto i = lbl.addChild("input", name);
-			i.attrs.name = name;
-			i.attrs.type = "file";
 		} else static if(is(T == K[], K)) {
 			auto templ = div.addChild("template");
-			templ.appendChild(elementFor!(K)(null, name));
+			templ.appendChild(elementFor!(K)(null, name, null /* uda??*/));
 			if(displayName !is null)
 				div.addChild("span", displayName, "label-text");
 			auto btn = div.addChild("button");
@@ -8849,10 +9907,15 @@ html", true, true);
 
 			static if(!mustNotBeSetFromWebParams!(param[0], __traits(getAttributes, param))) {
 				string displayName = beautify(__traits(identifier, param));
-				foreach(attr; __traits(getAttributes, param))
+				Element function() element;
+				foreach(attr; __traits(getAttributes, param)) {
 					static if(is(typeof(attr) == DisplayName))
 						displayName = attr.name;
-				auto i = form.appendChild(elementFor!(param)(displayName, __traits(identifier, param)));
+					else static if(is(typeof(attr) : typeof(element))) {
+						element = attr;
+					}
+				}
+				auto i = form.appendChild(elementFor!(param)(displayName, __traits(identifier, param), element));
 				if(i.querySelector("input[type=file]") !is null)
 					form.setAttribute("enctype", "multipart/form-data");
 			}
@@ -8880,10 +9943,13 @@ html", true, true);
 		foreach(idx, memberName; __traits(derivedMembers, T)) {{
 		static if(__traits(compiles, __traits(getMember, obj, memberName).offsetof)) {
 			string displayName = beautify(memberName);
+			Element function() element;
 			foreach(attr; __traits(getAttributes,  __traits(getMember, T, memberName)))
 				static if(is(typeof(attr) == DisplayName))
 					displayName = attr.name;
-			form.appendChild(elementFor!(typeof(__traits(getMember, T, memberName)))(displayName, memberName));
+				else static if(is(typeof(attr) : typeof(element)))
+					element = attr;
+			form.appendChild(elementFor!(typeof(__traits(getMember, T, memberName)))(displayName, memberName, element));
 
 			form.setValue(memberName, to!string(__traits(getMember, obj, memberName)));
 		}}}
@@ -8991,6 +10057,11 @@ html", true, true);
 					ol.addChild("li", formatReturnValueAsHtml(e));
 				return ol;
 			}
+		} else static if(is(T : Object)) {
+			static if(is(typeof(t.toHtml()))) // FIXME: maybe i will make this an interface
+				return Element.make("div", t.toHtml());
+			else
+				return Element.make("div", t.toString());
 		} else static assert(0, "bad return value for cgi call " ~ T.stringof);
 
 		assert(0);
@@ -9048,30 +10119,34 @@ struct MultipleResponses(T...) {
 		---
 			auto valueToTest = your_test_function();
 
-			valueToTest.visit!(
-				(Redirection) { assert(0); }, // got a redirection instead of a string, fail the test
+			valueToTest.visit(
+				(Redirection r) { assert(0); }, // got a redirection instead of a string, fail the test
 				(string s) { assert(s == "test"); } // right value, go ahead and test it.
 			);
 		---
+
+		History:
+			Was horribly broken until June 16, 2022. Ironically, I wrote it for tests but never actually tested it.
+			It tried to use alias lambdas before, but runtime delegates work much better so I changed it.
 	+/
-	void visit(Handlers...)() {
-		template findHandler(type, HandlersToCheck...) {
+	void visit(Handlers...)(Handlers handlers) {
+		template findHandler(type, int count, HandlersToCheck...) {
 			static if(HandlersToCheck.length == 0)
-				alias findHandler = void;
+				enum findHandler = -1;
 			else {
-				static if(is(typeof(HandlersToCheck[0](type.init))))
-					alias findHandler = handler;
+				static if(is(typeof(HandlersToCheck[0].init(type.init))))
+					enum findHandler = count;
 				else
-					alias findHandler = findHandler!(type, HandlersToCheck[1 .. $]);
+					enum findHandler = findHandler!(type, count + 1, HandlersToCheck[1 .. $]);
 			}
 		}
 		foreach(index, type; T) {
-			alias handler = findHandler!(type, Handlers);
-			static if(is(handler == void))
+			enum handlerIndex = findHandler!(type, 0, Handlers);
+			static if(handlerIndex == -1)
 				static assert(0, "Type " ~ type.stringof ~ " was not handled by visitor");
 			else {
-				if(index == contains)
-					handler(payload[index]);
+				if(index == this.contains)
+					handlers[handlerIndex](this.payload[index]);
 			}
 		}
 	}
@@ -9084,6 +10159,7 @@ struct MultipleResponses(T...) {
 	+/
 }
 
+// FIXME: implement this somewhere maybe
 struct RawResponse {
 	int code;
 	string[] headers;
@@ -9099,13 +10175,13 @@ struct RawResponse {
 +/
 struct Redirection {
 	string to; /// The URL to redirect to.
-	int code = 303; /// The HTTP code to retrn.
+	int code = 303; /// The HTTP code to return.
 }
 
 /++
 	Serves a class' methods, as a kind of low-state RPC over the web. To be used with [dispatcher].
 
-	Usage of this function will add a dependency on [arsd.dom] and [arsd.jsvar] unless you have overriden
+	Usage of this function will add a dependency on [arsd.dom] and [arsd.jsvar] unless you have overridden
 	the presenter in the dispatcher.
 
 	FIXME: explain this better
@@ -9156,7 +10232,12 @@ private string nextPieceFromSlash(ref string remainingUrl) {
 	return ident;
 }
 
+/++
+	UDA used to indicate to the [dispatcher] that a trailing slash should always be added to or removed from the url. It will do it as a redirect header as-needed.
++/
 enum AddTrailingSlash;
+/// ditto
+enum RemoveTrailingSlash;
 
 private auto serveApiInternal(T)(string urlPrefix) {
 
@@ -9213,7 +10294,7 @@ private auto serveApiInternal(T)(string urlPrefix) {
 			switch(cgi.request("format", "html")) {
 				case "html":
 					static void dummy() {}
-					presenter.presentExceptionAsHtml!(dummy)(cgi, t, &dummy);
+					presenter.presentExceptionAsHtml(cgi, t, null);
 				return true;
 				case "json":
 					var envelope = var.emptyObject;
@@ -9337,10 +10418,16 @@ private auto serveApiInternal(T)(string urlPrefix) {
 								cgi.setResponseLocation(cgi.pathInfo ~ "/");
 								return true;
 							}
+						} else static if(is(attr == RemoveTrailingSlash)) {
+							if(remainingUrl !is null) {
+								cgi.setResponseLocation(cgi.pathInfo[0 .. lastIndexOf(cgi.pathInfo, "/")]);
+								return true;
+							}
+
 						} else static if(__traits(isSame, AutomaticForm, attr)) {
 							automaticForm = true;
 						}
-				
+
 				/+
 				int zeroArgOverload = -1;
 				int overloadCount = cast(int) __traits(getOverloads, T, methodName).length;
@@ -9415,47 +10502,25 @@ private auto serveApiInternal(T)(string urlPrefix) {
 					if(callFunction)
 				+/
 
-					if(automaticForm && cgi.requestMethod == Cgi.RequestMethod.GET) {
+					auto format = cgi.request("format", defaultFormat!overload());
+					auto wantsFormFormat = format.startsWith("form-");
+
+					if(wantsFormFormat || (automaticForm && cgi.requestMethod == Cgi.RequestMethod.GET)) {
 						// Should I still show the form on a json thing? idk...
 						auto ret = presenter.createAutomaticFormForFunction!((__traits(getOverloads, obj, methodName)[idx]))(&(__traits(getOverloads, obj, methodName)[idx]));
-						presenter.presentSuccessfulReturn(cgi, ret, presenter.methodMeta!(__traits(getOverloads, obj, methodName)[idx]), "html");
+						presenter.presentSuccessfulReturn(cgi, ret, presenter.methodMeta!(__traits(getOverloads, obj, methodName)[idx]), wantsFormFormat ? format["form_".length .. $] : "html");
 						return true;
 					}
-					switch(cgi.request("format", defaultFormat!overload())) {
-						case "html":
-							// a void return (or typeof(null) lol) means you, the user, is doing it yourself. Gives full control.
-							try {
 
-								auto ret = callFromCgi!(__traits(getOverloads, obj, methodName)[idx])(&(__traits(getOverloads, obj, methodName)[idx]), cgi);
-								presenter.presentSuccessfulReturn(cgi, ret, presenter.methodMeta!(__traits(getOverloads, obj, methodName)[idx]), "html");
-							} catch(Throwable t) {
-								presenter.presentExceptionAsHtml!(__traits(getOverloads, obj, methodName)[idx])(cgi, t, &(__traits(getOverloads, obj, methodName)[idx]));
-							}
-						return true;
-						case "json":
-							auto ret = callFromCgi!(__traits(getOverloads, obj, methodName)[idx])(&(__traits(getOverloads, obj, methodName)[idx]), cgi);
-							static if(is(typeof(ret) == MultipleResponses!Types, Types...)) {
-								var json;
-								foreach(index, type; Types) {
-									if(ret.contains == index)
-										json = ret.payload[index];
-								}
-							} else {
-								var json = ret;
-							}
-							var envelope = json; // var.emptyObject;
-							/*
-							envelope.success = true;
-							envelope.result = json;
-							envelope.error = null;
-							*/
-							cgi.setResponseContentType("application/json");
-							cgi.write(envelope.toJson(), true);
-						return true;
-						default:
-							cgi.setResponseStatus("406 Not Acceptable"); // not exactly but sort of.
-						return true;
+					try {
+						// a void return (or typeof(null) lol) means you, the user, is doing it yourself. Gives full control.
+						auto ret = callFromCgi!(__traits(getOverloads, obj, methodName)[idx])(&(__traits(getOverloads, obj, methodName)[idx]), cgi);
+						presenter.presentSuccessfulReturn(cgi, ret, presenter.methodMeta!(__traits(getOverloads, obj, methodName)[idx]), format);
+					} catch(Throwable t) {
+						// presenter.presentExceptionAsHtml!(__traits(getOverloads, obj, methodName)[idx])(cgi, t, &(__traits(getOverloads, obj, methodName)[idx]));
+						presenter.presentExceptionalReturn(cgi, t, presenter.methodMeta!(__traits(getOverloads, obj, methodName)[idx]), format);
 					}
+					return true;
 				//}}
 
 				//cgi.header("Accept: POST"); // FIXME list the real thing
@@ -9477,7 +10542,7 @@ private auto serveApiInternal(T)(string urlPrefix) {
 			default:
 				return false;
 		}
-	
+
 		assert(0);
 	}
 	return DispatcherDefinition!internalHandler(urlPrefix, false);
@@ -9556,7 +10621,7 @@ template urlNamesForMethod(alias method, string default_) {
 	enum AccessCheck {
 		allowed,
 		denied,
-		nonExistant,
+		nonExistent,
 	}
 
 	enum Operation {
@@ -9583,6 +10648,8 @@ template urlNamesForMethod(alias method, string default_) {
 
 /++
 	The base of all REST objects, to be used with [serveRestObject] and [serveRestCollectionOf].
+
+	WARNING: this is not stable.
 +/
 class RestObject(CRTP) : WebObject {
 
@@ -9597,19 +10664,22 @@ class RestObject(CRTP) : WebObject {
 		show();
 	}
 
-	ValidationResult delegate(typeof(this)) validateFromReflection;
-	Element delegate(typeof(this)) toHtmlFromReflection;
-	var delegate(typeof(this)) toJsonFromReflection;
-
 	/// Override this to provide access control to this object.
 	AccessCheck accessCheck(string urlId, Operation operation) {
 		return AccessCheck.allowed;
 	}
 
 	ValidationResult validate() {
-		if(validateFromReflection !is null)
-			return validateFromReflection(this);
+		// FIXME
 		return ValidationResult.valid;
+	}
+
+	string getUrlSlug() {
+		import std.conv;
+		static if(is(typeof(CRTP.id)))
+			return to!string((cast(CRTP) this).id);
+		else
+			return null;
 	}
 
 	// The functions with more arguments are the low-level ones,
@@ -9621,7 +10691,9 @@ class RestObject(CRTP) : WebObject {
 		of the new object.
 	+/
 	string create(scope void delegate() applyChanges) {
-		return null;
+		applyChanges();
+		save();
+		return getUrlSlug();
 	}
 
 	void replace() {
@@ -9652,18 +10724,31 @@ class RestObject(CRTP) : WebObject {
 	abstract void load(string urlId);
 	abstract void save();
 
-	Element toHtml() {
-		if(toHtmlFromReflection)
-			return toHtmlFromReflection(this);
-		else
-			assert(0);
+	Element toHtml(Presenter)(Presenter presenter) {
+		import arsd.dom;
+		import std.conv;
+		auto obj = cast(CRTP) this;
+		auto div = Element.make("div");
+		div.addClass("Dclass_" ~ CRTP.stringof);
+		div.dataset.url = getUrlSlug();
+		bool first = true;
+		foreach(idx, memberName; __traits(derivedMembers, CRTP))
+		static if(__traits(compiles, __traits(getMember, obj, memberName).offsetof)) {
+			if(!first) div.addChild("br"); else first = false;
+			div.appendChild(presenter.formatReturnValueAsHtml(__traits(getMember, obj, memberName)));
+		}
+		return div;
 	}
 
 	var toJson() {
-		if(toJsonFromReflection)
-			return toJsonFromReflection(this);
-		else
-			assert(0);
+		import arsd.jsvar;
+		var v = var.emptyObject();
+		auto obj = cast(CRTP) this;
+		foreach(idx, memberName; __traits(derivedMembers, CRTP))
+		static if(__traits(compiles, __traits(getMember, obj, memberName).offsetof)) {
+			v[memberName] = __traits(getMember, obj, memberName);
+		}
+		return v;
 	}
 
 	/+
@@ -9773,7 +10858,7 @@ class CollectionOf(Obj) : RestObject!(CollectionOf) {
 	remove
 
 	You will want to be able to customize the HTTP, HTML, and JSON returns but generally shouldn't have to - the defaults
-	should usually work. The returned JSON will include a field "href" on all returned objects along with "id". Or omething like that.
+	should usually work. The returned JSON will include a field "href" on all returned objects along with "id". Or something like that.
 
 	Usage of this function will add a dependency on [arsd.dom] and [arsd.jsvar].
 
@@ -9892,32 +10977,6 @@ bool restObjectServeHandler(T, Presenter)(Cgi cgi, Presenter presenter, string u
 	// FIXME: support precondition failed, if-modified-since, expectation failed, etc.
 
 	auto obj = new T();
-	obj.toHtmlFromReflection = delegate(t) {
-		import arsd.dom;
-		auto div = Element.make("div");
-		div.addClass("Dclass_" ~ T.stringof);
-		div.dataset.url = urlId;
-		bool first = true;
-		foreach(idx, memberName; __traits(derivedMembers, T))
-		static if(__traits(compiles, __traits(getMember, obj, memberName).offsetof)) {
-			if(!first) div.addChild("br"); else first = false;
-			div.appendChild(presenter.formatReturnValueAsHtml(__traits(getMember, obj, memberName)));
-		}
-		return div;
-	};
-	obj.toJsonFromReflection = delegate(t) {
-		import arsd.jsvar;
-		var v = var.emptyObject();
-		foreach(idx, memberName; __traits(derivedMembers, T))
-		static if(__traits(compiles, __traits(getMember, obj, memberName).offsetof)) {
-			v[memberName] = __traits(getMember, obj, memberName);
-		}
-		return v;
-	};
-	obj.validateFromReflection = delegate(t) {
-		// FIXME
-		return ValidationResult.valid;
-	};
 	obj.initialize(cgi);
 	// FIXME: populate reflection info delegates
 
@@ -9968,13 +11027,14 @@ bool restObjectServeHandler(T, Presenter)(Cgi cgi, Presenter presenter, string u
 				`);
 				else
 				container.appendHtml(`
+					<a href="..">Back</a>
 					<form>
 						<button type="submit" name="_method" value="PATCH">Edit</button>
 						<button type="submit" name="_method" value="DELETE">Delete</button>
 					</form>
 				`);
 			}
-			container.appendChild(obj.toHtml());
+			container.appendChild(obj.toHtml(presenter));
 			cgi.write(container.parentDocument.toString, true);
 		}
 	}
@@ -9989,7 +11049,7 @@ bool restObjectServeHandler(T, Presenter)(Cgi cgi, Presenter presenter, string u
 			// sure, it doesn't automatically work in subclasses... but I instantiate here anyway...
 
 			// automatic forms here for usable basic auto site from browser.
-			// even if the format is json, it could actually send out the links and formats, but really there i'ma be meh.
+			// even if the format is json, it could actually send out the links and formats
 			switch(cgi.request("_method", "GET")) {
 				case "GET":
 					static if(is(T : CollectionOf!(C), C)) {
@@ -10109,19 +11169,17 @@ bool restObjectServeHandler(T, Presenter)(Cgi cgi, Presenter presenter, string u
 			// FIXME: OPTIONS, HEAD
 	}
 	catch(Throwable t) {
-		presenter.presentExceptionAsHtml!(DUMMY)(cgi, t, null);
+		presenter.presentExceptionAsHtml(cgi, t);
 	}
 
 	return true;
 }
 
-struct DUMMY {}
-
 /+
 struct SetOfFields(T) {
 	private void[0][string] storage;
 	void set(string what) {
-		//storage[what] = 
+		//storage[what] =
 	}
 	void unset(string what) {}
 	void setAll() {}
@@ -10136,6 +11194,33 @@ enum hideonindex;
 +/
 
 /++
+	Returns true if I recommend gzipping content of this type. You might
+	want to call it from your Presenter classes before calling cgi.write.
+
+	---
+	cgi.setResponseContentType(yourContentType);
+	cgi.gzipResponse = gzipRecommendedForContentType(yourContentType);
+	cgi.write(yourData, true);
+	---
+
+	This is used internally by [serveStaticFile], [serveStaticFileDirectory], [serveStaticData], and maybe others I forgot to update this doc about.
+
+
+	The implementation considers text content to be recommended to gzip. This may change, but it seems reasonable enough for now.
+
+	History:
+		Added January 28, 2023 (dub v11.0)
++/
+bool gzipRecommendedForContentType(string contentType) {
+	if(contentType.startsWith("text/"))
+		return true;
+	if(contentType.startsWith("application/javascript"))
+		return true;
+
+	return false;
+}
+
+/++
 	Serves a static file. To be used with [dispatcher].
 
 	See_Also: [serveApi], [serveRestObject], [dispatcher], [serveRedirect]
@@ -10145,7 +11230,7 @@ auto serveStaticFile(string urlPrefix, string filename = null, string contentTyp
 // man 2 sendfile
 	assert(urlPrefix[0] == '/');
 	if(filename is null)
-		filename = urlPrefix[1 .. $];
+		filename = decodeComponent(urlPrefix[1 .. $]); // FIXME is this actually correct?
 	if(contentType is null) {
 		contentType = contentTypeFromFileExtension(filename);
 	}
@@ -10156,18 +11241,47 @@ auto serveStaticFile(string urlPrefix, string filename = null, string contentTyp
 	}
 
 	static bool internalHandler(string urlPrefix, Cgi cgi, Object presenter, DispatcherDetails details) {
-		if(details.contentType.indexOf("image/") == 0)
+		if(details.contentType.indexOf("image/") == 0 || details.contentType.indexOf("audio/") == 0)
 			cgi.setCache(true);
 		cgi.setResponseContentType(details.contentType);
+		cgi.gzipResponse = gzipRecommendedForContentType(details.contentType);
 		cgi.write(std.file.read(details.filename), true);
 		return true;
 	}
 	return DispatcherDefinition!(internalHandler, DispatcherDetails)(urlPrefix, true, DispatcherDetails(filename, contentType));
 }
 
+/++
+	Serves static data. To be used with [dispatcher].
+
+	History:
+		Added October 31, 2021
++/
+auto serveStaticData(string urlPrefix, immutable(void)[] data, string contentType = null) {
+	assert(urlPrefix[0] == '/');
+	if(contentType is null) {
+		contentType = contentTypeFromFileExtension(urlPrefix);
+	}
+
+	static struct DispatcherDetails {
+		immutable(void)[] data;
+		string contentType;
+	}
+
+	static bool internalHandler(string urlPrefix, Cgi cgi, Object presenter, DispatcherDetails details) {
+		cgi.setCache(true);
+		cgi.setResponseContentType(details.contentType);
+		cgi.write(details.data, true);
+		return true;
+	}
+	return DispatcherDefinition!(internalHandler, DispatcherDetails)(urlPrefix, true, DispatcherDetails(data, contentType));
+}
+
 string contentTypeFromFileExtension(string filename) {
 		if(filename.endsWith(".png"))
 			return "image/png";
+		if(filename.endsWith(".apng"))
+			return "image/apng";
 		if(filename.endsWith(".svg"))
 			return "image/svg+xml";
 		if(filename.endsWith(".jpg"))
@@ -10182,28 +11296,56 @@ string contentTypeFromFileExtension(string filename) {
 			return "application/wasm";
 		if(filename.endsWith(".mp3"))
 			return "audio/mpeg";
+		if(filename.endsWith(".pdf"))
+			return "application/pdf";
 		return null;
 }
 
 /// This serves a directory full of static files, figuring out the content-types from file extensions.
 /// It does not let you to descend into subdirectories (or ascend out of it, of course)
-auto serveStaticFileDirectory(string urlPrefix, string directory = null) {
+auto serveStaticFileDirectory(string urlPrefix, string directory = null, bool recursive = false) {
 	assert(urlPrefix[0] == '/');
 	assert(urlPrefix[$-1] == '/');
 
 	static struct DispatcherDetails {
 		string directory;
+		bool recursive;
 	}
 
 	if(directory is null)
 		directory = urlPrefix[1 .. $];
 
+	if(directory.length == 0)
+		directory = "./";
+
 	assert(directory[$-1] == '/');
 
 	static bool internalHandler(string urlPrefix, Cgi cgi, Object presenter, DispatcherDetails details) {
-		auto file = cgi.pathInfo[urlPrefix.length .. $];
-		if(file.indexOf("/") != -1 || file.indexOf("\\") != -1)
-			return false;
+		auto file = decodeComponent(cgi.pathInfo[urlPrefix.length .. $]); // FIXME: is this actually correct
+
+		if(details.recursive) {
+			// never allow a backslash since it isn't in a typical url anyway and makes the following checks easier
+			if(file.indexOf("\\") != -1)
+				return false;
+
+			import std.path;
+
+			file = std.path.buildNormalizedPath(file);
+			enum upOneDir = ".." ~ std.path.dirSeparator;
+
+			// also no point doing any kind of up directory things since that makes it more likely to break out of the parent
+			if(file == ".." || file.startsWith(upOneDir))
+				return false;
+			if(std.path.isAbsolute(file))
+				return false;
+
+			// FIXME: if it has slashes and stuff, should we redirect to the canonical resource? or what?
+
+			// once it passes these filters it is probably ok.
+		} else {
+			if(file.indexOf("/") != -1 || file.indexOf("\\") != -1)
+				return false;
+		}
 
 		auto contentType = contentTypeFromFileExtension(file);
 
@@ -10214,6 +11356,7 @@ auto serveStaticFileDirectory(string urlPrefix, string directory = null) {
 			//else if(contentType.indexOf("audio/") == 0)
 				cgi.setCache(true);
 			cgi.setResponseContentType(contentType);
+			cgi.gzipResponse = gzipRecommendedForContentType(contentType);
 			cgi.write(std.file.read(fn), true);
 			return true;
 		} else {
@@ -10221,7 +11364,7 @@ auto serveStaticFileDirectory(string urlPrefix, string directory = null) {
 		}
 	}
 
-	return DispatcherDefinition!(internalHandler, DispatcherDetails)(urlPrefix, false, DispatcherDetails(directory));
+	return DispatcherDefinition!(internalHandler, DispatcherDetails)(urlPrefix, false, DispatcherDetails(directory, recursive));
 }
 
 /++
@@ -10299,14 +11442,162 @@ auto dispatchTo(alias handler)(string urlPrefix) {
 	return DispatcherDefinition!(internalHandler)(urlPrefix, false);
 }
 
-/+
 /++
 	See [serveStaticFile] if you want to serve a file off disk.
-+/
-auto serveStaticData(string urlPrefix, const(void)[] data, string contentType) {
 
-}
+	History:
+		Added January 28, 2023 (dub v11.0)
 +/
+auto serveStaticData(string urlPrefix, immutable(ubyte)[] data, string contentType, string filenameToSuggestAsDownload = null) {
+	assert(urlPrefix[0] == '/');
+
+	static struct DispatcherDetails {
+		immutable(ubyte)[] data;
+		string contentType;
+		string filenameToSuggestAsDownload;
+	}
+
+	static bool internalHandler(string urlPrefix, Cgi cgi, Object presenter, DispatcherDetails details) {
+		cgi.setCache(true);
+		cgi.setResponseContentType(details.contentType);
+		if(details.filenameToSuggestAsDownload.length)
+    			cgi.header("Content-Disposition: attachment; filename=\""~details.filenameToSuggestAsDownload~"\"");
+		cgi.gzipResponse = gzipRecommendedForContentType(details.contentType);
+		cgi.write(details.data, true);
+		return true;
+	}
+	return DispatcherDefinition!(internalHandler, DispatcherDetails)(urlPrefix, true, DispatcherDetails(data, contentType, filenameToSuggestAsDownload));
+}
+
+/++
+	Placeholder for use with [dispatchSubsection]'s `NewPresenter` argument to indicate you want to keep the parent's presenter.
+
+	History:
+		Added January 28, 2023 (dub v11.0)
++/
+alias KeepExistingPresenter = typeof(null);
+
+/++
+	For use with [dispatchSubsection]. Calls your filter with the request and if your filter returns false,
+	this issues the given errorCode and stops processing.
+
+	---
+		bool hasAdminPermissions(Cgi cgi) {
+			return true;
+		}
+
+		mixin DispatcherMain!(
+			"/admin".dispatchSubsection!(
+				passFilterOrIssueError!(hasAdminPermissions, 403),
+				KeepExistingPresenter,
+				"/".serveApi!AdminFunctions
+			)
+		);
+	---
+
+	History:
+		Added January 28, 2023 (dub v11.0)
++/
+template passFilterOrIssueError(alias filter, int errorCode) {
+	bool passFilterOrIssueError(DispatcherDetails)(DispatcherDetails dd) {
+		if(filter(dd.cgi))
+			return true;
+		dd.presenter.renderBasicError(dd.cgi, errorCode);
+		return false;
+	}
+}
+
+/++
+	Allows for a subsection of your dispatched urls to be passed through other a pre-request filter, optionally pick up an new presenter class,
+	and then be dispatched to their own handlers.
+
+	---
+	/+
+	// a long-form filter function
+	bool permissionCheck(DispatcherData)(DispatcherData dd) {
+		// you are permitted to call mutable methods on the Cgi object
+		// Note if you use a Cgi subclass, you can try dynamic casting it back to your custom type to attach per-request data
+		// though much of the request is immutable so there's only so much you're allowed to do to modify it.
+
+		if(checkPermissionOnRequest(dd.cgi)) {
+			return true; // OK, allow processing to continue
+		} else {
+			dd.presenter.renderBasicError(dd.cgi, 403); // reply forbidden to the requester
+			return false; // and stop further processing into this subsection
+		}
+	}
+	+/
+
+	// but you can also do short-form filters:
+
+	bool permissionCheck(Cgi cgi) {
+		return ("ok" in cgi.get) !is null;
+	}
+
+	// handler for the subsection
+	class AdminClass : WebObject {
+		int foo() { return 5; }
+	}
+
+	// handler for the main site
+	class TheMainSite : WebObject {}
+
+	mixin DispatcherMain!(
+		"/admin".dispatchSubsection!(
+			// converts our short-form filter into a long-form filter
+			passFilterOrIssueError!(permissionCheck, 403),
+			// can use a new presenter if wanted for the subsection
+			KeepExistingPresenter,
+			// and then provide child route dispatchers
+			"/".serveApi!AdminClass
+		),
+		// and back to the top level
+		"/".serveApi!TheMainSite
+	);
+	---
+
+	Note you can encapsulate sections in files like this:
+
+	---
+	auto adminDispatcher(string urlPrefix) {
+		return urlPrefix.dispatchSubsection!(
+			....
+		);
+	}
+
+	mixin DispatcherMain!(
+		"/admin".adminDispatcher,
+		// and so on
+	)
+	---
+
+	If you want no filter, you can pass `(cgi) => true` as the filter to approve all requests.
+
+	If you want to keep the same presenter as the parent, use [KeepExistingPresenter] as the presenter argument.
+
+
+	History:
+		Added January 28, 2023 (dub v11.0)
++/
+auto dispatchSubsection(alias PreRequestFilter, NewPresenter, definitions...)(string urlPrefix) {
+	assert(urlPrefix[0] == '/');
+	assert(urlPrefix[$-1] != '/');
+	static bool internalHandler(Presenter)(string urlPrefix, Cgi cgi, Presenter presenter, const void* details) {
+		static if(!is(PreRequestFilter == typeof(null))) {
+			if(!PreRequestFilter(DispatcherData!Presenter(cgi, presenter, urlPrefix.length)))
+				return true; // we handled it by rejecting it
+		}
+
+		static if(is(NewPresenter == Presenter) || is(NewPresenter == typeof(null))) {
+			return dispatcher!definitions(DispatcherData!Presenter(cgi, presenter, urlPrefix.length));
+		} else {
+			auto newPresenter = new NewPresenter();
+			return dispatcher!(definitions(DispatcherData!NewPresenter(cgi, presenter, urlPrefix.length)));
+		}
+	}
+
+	return DispatcherDefinition!(internalHandler)(urlPrefix, false);
+}
 
 /++
 	A URL dispatcher.
@@ -10323,10 +11614,11 @@ auto serveStaticData(string urlPrefix, const(void)[] data, string contentType) {
 
 	You define a series of url prefixes followed by handlers.
 
-	[dispatchTo] will send the request to another function for handling.
 	You may want to do different pre- and post- processing there, for example,
 	an authorization check and different page layout. You can use different
-	presenters and different function chains. NOT IMPLEMENTED
+	presenters and different function chains. See [dispatchSubsection] for details.
+
+	[dispatchTo] will send the request to another function for handling.
 +/
 template dispatcher(definitions...) {
 	bool dispatcher(Presenter)(Cgi cgi, Presenter presenterArg = null) {
@@ -10428,27 +11720,58 @@ private static string getHttpCodeText(int code) pure nothrow @nogc {
 		case 203: return "203 Non-Authoritative Information";
 		case 204: return "204 No Content";
 		case 205: return "205 Reset Content";
+		case 206: return "206 Partial Content";
 		//
 		case 300: return "300 Multiple Choices";
 		case 301: return "301 Moved Permanently";
 		case 302: return "302 Found";
 		case 303: return "303 See Other";
+		case 304: return "304 Not Modified";
+		case 305: return "305 Use Proxy";
 		case 307: return "307 Temporary Redirect";
 		case 308: return "308 Permanent Redirect";
+
 		//
-		// FIXME: add more common 400 ones cgi.d might return too
 		case 400: return "400 Bad Request";
+		case 401: return "401 Unauthorized";
+		case 402: return "402 Payment Required";
 		case 403: return "403 Forbidden";
 		case 404: return "404 Not Found";
 		case 405: return "405 Method Not Allowed";
 		case 406: return "406 Not Acceptable";
+		case 407: return "407 Proxy Authentication Required";
+		case 408: return "408 Request Timeout";
 		case 409: return "409 Conflict";
 		case 410: return "410 Gone";
-		//
+		case 411: return "411 Length Required";
+		case 412: return "412 Precondition Failed";
+		case 413: return "413 Payload Too Large";
+		case 414: return "414 URI Too Long";
+		case 415: return "415 Unsupported Media Type";
+		case 416: return "416 Range Not Satisfiable";
+		case 417: return "417 Expectation Failed";
+		case 418: return "418 I'm a teapot";
+		case 421: return "421 Misdirected Request";
+		case 422: return "422 Unprocessable Entity (WebDAV)";
+		case 423: return "423 Locked (WebDAV)";
+		case 424: return "424 Failed Dependency (WebDAV)";
+		case 425: return "425 Too Early";
+		case 426: return "426 Upgrade Required";
+		case 428: return "428 Precondition Required";
+		case 431: return "431 Request Header Fields Too Large";
+		case 451: return "451 Unavailable For Legal Reasons";
+
 		case 500: return "500 Internal Server Error";
 		case 501: return "501 Not Implemented";
 		case 502: return "502 Bad Gateway";
 		case 503: return "503 Service Unavailable";
+		case 504: return "504 Gateway Timeout";
+		case 505: return "505 HTTP Version Not Supported";
+		case 506: return "506 Variant Also Negotiates";
+		case 507: return "507 Insufficient Storage (WebDAV)";
+		case 508: return "508 Loop Detected (WebDAV)";
+		case 510: return "510 Not Extended";
+		case 511: return "511 Network Authentication Required";
 		//
 		default: assert(0, "Unsupported http code");
 	}
@@ -10476,12 +11799,14 @@ bool apiDispatcher()(Cgi cgi) {
 	import arsd.dom;
 }
 +/
+version(linux)
+private extern(C) int eventfd (uint initval, int flags) nothrow @trusted @nogc;
 /*
-Copyright: Adam D. Ruppe, 2008 - 2021
+Copyright: Adam D. Ruppe, 2008 - 2023
 License:   [http://www.boost.org/LICENSE_1_0.txt|Boost License 1.0].
 Authors: Adam D. Ruppe
 
-	Copyright Adam D. Ruppe 2008 - 2021.
+	Copyright Adam D. Ruppe 2008 - 2023.
 Distributed under the Boost Software License, Version 1.0.
    (See accompanying file LICENSE_1_0.txt or copy at
 	http://www.boost.org/LICENSE_1_0.txt)

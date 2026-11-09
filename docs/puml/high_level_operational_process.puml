@@ -1,0 +1,76 @@
+@startuml
+title OneDrive Client for Linux - High Level Operational Process
+
+participant "OneDrive Client\nfor Linux" as Client
+participant "SQLite last-applied\nstate" as DB
+participant "Local filesystem" as FS
+participant "Microsoft Graph /\nOneDrive service" as Graph
+
+== Startup and safety gates ==
+Client -> Client: Load configuration and initialise runtime services
+Client -> Client: Establish / refresh authentication as required
+Client -> Client: Validate service reachability and system time when enabled
+
+alt ~--local-first
+  == Local reconciliation first ==
+  Client -> DB: Read tracked last-applied state
+  Client -> FS: Compare tracked items with live filesystem
+  alt Tracked local item was modified / moved / deleted
+    Client -> Graph: Apply applicable local change online
+    Graph --> Client: Current resulting metadata
+    Client -> DB: Save successfully reconciled state
+  end
+
+  Client -> FS: Scan for new local data
+  loop New local candidates
+    Client -> Client: Apply local client-side filtering
+    opt Candidate should be synchronised
+      Client -> Graph: Create directory / upload file
+      Graph --> Client: Current resulting metadata
+      Client -> DB: Save successfully reconciled state
+    end
+  end
+
+  == Online reconciliation last ==
+  Client -> Graph: Enumerate current online state\n(/delta or generated traversal)
+  Graph --> Client: Paged/current DriveItem JSON
+  Client -> Client: Validate, filter, classify and reconcile online items
+  Client -> FS: Apply required local actions / transactional downloads
+  Client -> DB: Save state only as applicable operations commit
+
+else Default remote-first
+  == Online reconciliation first ==
+  Client -> Graph: Enumerate current online state\n(/delta or generated traversal)
+  Graph --> Client: Paged/current DriveItem JSON
+  Client -> Client: Validate, filter, classify and reconcile online items
+  Client -> FS: Apply required local actions / transactional downloads
+  Client -> DB: Save state only as applicable operations commit
+
+  == Local reconciliation ==
+  Client -> DB: Read tracked last-applied state
+  Client -> FS: Compare tracked items with live filesystem
+  alt Tracked local item was modified / moved / deleted
+    Client -> Graph: Apply applicable local change online
+    Graph --> Client: Current resulting metadata
+    Client -> DB: Save successfully reconciled state
+  end
+
+  opt Upload-side processing is enabled
+    Client -> FS: Scan for new local data
+    loop New local candidates
+      Client -> Client: Apply local client-side filtering
+      opt Candidate should be synchronised
+        Client -> Graph: Create directory / upload file
+        Graph --> Client: Current resulting metadata
+        Client -> DB: Save successfully reconciled state
+      end
+    end
+
+    opt force_children_scan is not enabled
+      Client -> Graph: Perform final online true-up
+      Graph --> Client: Additional changes, if any
+      Client -> Client: Reconcile remaining online changes
+    end
+  end
+end
+@enduml

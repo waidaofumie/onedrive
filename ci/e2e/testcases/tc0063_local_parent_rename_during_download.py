@@ -1,0 +1,467 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+from framework.base import E2ETestCase
+from framework.context import E2EContext
+from framework.result import TestResult
+from framework.pdf import REVISION_0 as PDF_REVISION_0, REVISION_1 as PDF_REVISION_1, create_random_pdf_pair, copy_pdf_pair, mutate_pdf_pair_revision, validate_pdf_pair
+from framework.image import REVISION_0 as IMAGE_REVISION_0, REVISION_1 as IMAGE_REVISION_1, create_random_image_set, copy_image_set, mutate_image_set_revision, validate_image_set
+from framework.utils import command_to_string, reset_directory, run_command, write_onedrive_config, write_text_file
+from framework.xlsx import REVISION_0, REVISION_1, create_random_xlsx_pair, copy_xlsx_pair, mutate_xlsx_pair_revision, validate_xlsx_pair
+
+
+class TestCase0063LocalParentRenameDuringDownload(E2ETestCase):
+    case_id = "0063"
+    name = "local parent rename during active download"
+    description = (
+        "Run a normal local_first sync, trigger a required download, then rename the "
+        "downloaded file's local parent directory while the download/finalisation path is active"
+    )
+
+    TARGET_RELATIVE = "Documents/divers/jeux intéressants.odt"
+    NOTES_RELATIVE = "Documents/divers/Notes/dummy.txt"
+    XLSX_RELATIVE = "Documents/divers/Notes/real-workbook.xlsx"
+    PDF_RELATIVE = "Documents/divers/Notes/real-document.pdf"
+    IMAGE_RELATIVE = "Documents/divers/Notes/real-image.png"
+    XLSX_PAYLOAD_ROWS = 32
+
+    def _write_config(self, config_path: Path, sync_dir: Path, *, local_first: bool = False) -> None:
+        content = (
+            "# tc0063 config\n"
+            f'sync_dir = "{sync_dir}"\n'
+            'bypass_data_preservation = "true"\n'
+            # Keep remote notification timing from masking the deterministic normal sync path.
+            'disable_websocket_support = "true"\n'
+        )
+        if local_first:
+            content += 'local_first = "true"\n'
+        write_onedrive_config(config_path, content)
+
+    def _write_large_file(self, path: Path, *, size_mb: int, fill_byte: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        block = fill_byte * (1024 * 1024)
+        with path.open("wb") as handle:
+            for _ in range(size_mb):
+                handle.write(block)
+
+    def _read_text(self, path: Path) -> str:
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    def _reader_thread(self, stream, output_file: Path, buffer: list[str], target_progress_marker: str,
+                       target_progress_seen: threading.Event) -> None:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with output_file.open("w", encoding="utf-8", errors="replace") as handle:
+            # Read through EOF, including diagnostics emitted immediately before exit.
+            for line in stream:
+                buffer.append(line)
+                handle.write(line)
+                handle.flush()
+                if target_progress_marker in line:
+                    progress = re.search(r"\.\.\.\s+(\d+)%", line)
+                    if progress and 0 < int(progress.group(1)) < 100:
+                        target_progress_seen.set()
+
+    def _run_sync_with_parent_rename(self, *, context: E2EContext, command: list[str], sync_root: Path, root_name: str,
+                                     stdout_file: Path, stderr_file: Path, mutation_log_file: Path,
+                                     timeout_seconds: int = 420) -> tuple[int, bool, str, str, dict[str, object]]:
+        old_parent = sync_root / root_name / "Documents" / "divers"
+        new_parent = sync_root / root_name / "Documents" / "divers-renamed-during-download"
+        target_path = sync_root / root_name / self.TARGET_RELATIVE
+        initial_size = target_path.stat().st_size if target_path.exists() else -1
+        initial_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
+
+        stdout_buffer: list[str] = []
+        stderr_buffer: list[str] = []
+        stop_event = threading.Event()
+        target_progress_seen = threading.Event()
+        mutation_done = threading.Event()
+        mutation_details: dict[str, object] = {
+            "initial_target_size": initial_size,
+            "initial_target_mtime": initial_mtime,
+            "old_parent": str(old_parent),
+            "new_parent": str(new_parent),
+            "target_path": str(target_path),
+            "trigger": "",
+            "rename_error": "",
+        }
+
+        def log_mutation(line: str) -> None:
+            with mutation_log_file.open("a", encoding="utf-8", errors="replace") as handle:
+                handle.write(line.rstrip("\n") + "\n")
+
+        def try_rename(trigger: str) -> None:
+            if mutation_done.is_set():
+                return
+            try:
+                mutation_details["trigger"] = trigger
+                if new_parent.exists():
+                    shutil.rmtree(new_parent)
+                if old_parent.exists():
+                    old_parent.rename(new_parent)
+                    mutation_details["rename_success"] = True
+                    log_mutation(f"RENAMED trigger={trigger} old={old_parent} new={new_parent}")
+                else:
+                    mutation_details["rename_success"] = False
+                    mutation_details["rename_error"] = f"old parent did not exist: {old_parent}"
+                    log_mutation(f"NOT_RENAMED trigger={trigger} reason=old_parent_missing old={old_parent}")
+            except Exception as exc:  # noqa: BLE001 - preserve the exact failure in artifacts
+                mutation_details["rename_success"] = False
+                mutation_details["rename_error"] = repr(exc)
+                log_mutation(f"RENAME_EXCEPTION trigger={trigger} error={exc!r}")
+            finally:
+                mutation_done.set()
+
+        def mutator() -> None:
+            # Rename only when the specific target is demonstrably downloading.
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline and not stop_event.is_set() and not mutation_done.is_set():
+                if target_progress_seen.wait(timeout=0.05) and not stop_event.is_set():
+                    try_rename("stdout-target-download-progress")
+                    return
+
+            log_mutation("MUTATOR_NO_TARGET_PROGRESS no active target download observed")
+            mutation_details["rename_success"] = False
+            mutation_details["rename_error"] = "no active target download observed"
+            mutation_done.set()
+
+        # stdbuf improves the chance that progress output is visible while the download is active.
+        effective_command = command
+        if shutil.which("stdbuf"):
+            effective_command = ["stdbuf", "-oL", "-eL", *command]
+
+        context.log(f"Executing Test Case {self.case_id} final sync with concurrent parent rename: {command_to_string(effective_command)}")
+        process = subprocess.Popen(
+            effective_command,
+            cwd=str(context.repo_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=0,
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        target_progress_marker = f"Downloading: {root_name}/{self.TARGET_RELATIVE} ..."
+        stdout_thread = threading.Thread(target=self._reader_thread, args=(process.stdout, stdout_file, stdout_buffer, target_progress_marker, target_progress_seen), daemon=True)
+        stderr_thread = threading.Thread(target=self._reader_thread, args=(process.stderr, stderr_file, stderr_buffer, target_progress_marker, target_progress_seen), daemon=True)
+        mutate_thread = threading.Thread(target=mutator, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        mutate_thread.start()
+
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                returncode = process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=20)
+            mutation_details["process_timeout"] = True
+        finally:
+            stop_event.set()
+            stdout_thread.join()
+            stderr_thread.join()
+            mutate_thread.join(timeout=10)
+
+        return returncode, bool(mutation_details.get("rename_success", False)), "".join(stdout_buffer), "".join(stderr_buffer), mutation_details
+
+    def run(self, context: E2EContext) -> TestResult:
+        layout = self.prepare_case_layout(context, case_dir_name="tc0063", ensure_refresh_token=True)
+        case_work_dir = layout.work_dir
+        case_log_dir = layout.log_dir
+        state_dir = layout.state_dir
+
+        seed_root = case_work_dir / "seedroot"
+        local_root = case_work_dir / "localroot"
+        remote_update_root = case_work_dir / "remoteupdateroot"
+        conf_seed = case_work_dir / "conf-seed"
+        conf_local = case_work_dir / "conf-local"
+        conf_remote = case_work_dir / "conf-remote"
+
+        root_name = f"ZZ_E2E_TC0063_{context.run_id}_{os.getpid()}"
+        target_relative = f"{root_name}/{self.TARGET_RELATIVE}"
+        notes_relative = f"{root_name}/{self.NOTES_RELATIVE}"
+        xlsx_relative = f"{root_name}/{self.XLSX_RELATIVE}"
+        pdf_relative = f"{root_name}/{self.PDF_RELATIVE}"
+        image_relative = f"{root_name}/{self.IMAGE_RELATIVE}"
+        seed_xlsx = seed_root / xlsx_relative
+        local_xlsx = local_root / xlsx_relative
+        remote_update_xlsx = remote_update_root / xlsx_relative
+        seed_pdf = seed_root / pdf_relative
+        local_pdf = local_root / pdf_relative
+        remote_update_pdf = remote_update_root / pdf_relative
+        seed_image = seed_root / image_relative
+        local_image = local_root / image_relative
+        remote_update_image = remote_update_root / image_relative
+        xlsx_seed = f"{context.run_id}:{context.e2e_target}:TC0063:{os.getpid()}"
+        pdf_seed = f"{xlsx_seed}:pdf"
+        image_seed = f"{xlsx_seed}:image"
+
+        reset_directory(seed_root)
+        reset_directory(local_root)
+        reset_directory(remote_update_root)
+
+        self._write_large_file(seed_root / target_relative, size_mb=48, fill_byte=b"A")
+        write_text_file(seed_root / notes_relative, "TC0063 baseline Notes content\n")
+        generated_xlsx = create_random_xlsx_pair(
+            seed_xlsx,
+            xlsx_seed,
+            revision=REVISION_0,
+            payload_rows=self.XLSX_PAYLOAD_ROWS,
+            title="TC0063 parent rename during download workbook",
+        )
+        generated_pdf = create_random_pdf_pair(
+            seed_pdf,
+            pdf_seed,
+            revision=PDF_REVISION_0,
+            title="TC0063 parent rename during download PDF",
+        )
+        generated_images = create_random_image_set(seed_image, image_seed, revision=IMAGE_REVISION_0, title="TC0063 parent rename during download images")
+        self._write_large_file(remote_update_root / target_relative, size_mb=80, fill_byte=b"B")
+        write_text_file(remote_update_root / notes_relative, "TC0063 baseline Notes content\n")
+
+        context.bootstrap_config_dir(conf_seed)
+        self._write_config(conf_seed / "config", seed_root)
+        context.bootstrap_config_dir(conf_local)
+        self._write_config(conf_local / "config", local_root)
+        context.bootstrap_config_dir(conf_remote)
+        self._write_config(conf_remote / "config", remote_update_root)
+
+        seed_stdout = case_log_dir / "seed_stdout.log"
+        seed_stderr = case_log_dir / "seed_stderr.log"
+        initial_download_stdout = case_log_dir / "initial_download_stdout.log"
+        initial_download_stderr = case_log_dir / "initial_download_stderr.log"
+        remote_update_stdout = case_log_dir / "remote_update_stdout.log"
+        remote_update_stderr = case_log_dir / "remote_update_stderr.log"
+        final_stdout = case_log_dir / "final_local_first_sync_stdout.log"
+        final_stderr = case_log_dir / "final_local_first_sync_stderr.log"
+        mutation_log = case_log_dir / "parent_rename_mutation.log"
+        metadata_file = state_dir / "metadata.txt"
+
+        artifacts = [
+            str(seed_stdout),
+            str(seed_stderr),
+            str(initial_download_stdout),
+            str(initial_download_stderr),
+            str(remote_update_stdout),
+            str(remote_update_stderr),
+            str(final_stdout),
+            str(final_stderr),
+            str(mutation_log),
+            str(metadata_file),
+        ]
+
+        seed_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--sync",
+            "--upload-only",
+            "--verbose",
+            "--resync",
+            "--resync-auth",
+            "--single-directory",
+            root_name,
+            "--confdir",
+            str(conf_seed),
+        ]
+        context.log(f"Executing Test Case {self.case_id} seed upload: {command_to_string(seed_command)}")
+        seed_result = run_command(seed_command, cwd=context.repo_root)
+        write_text_file(seed_stdout, seed_result.stdout)
+        write_text_file(seed_stderr, seed_result.stderr)
+        if seed_result.returncode != 0:
+            return self.fail_result(self.case_id, self.name, f"Seed upload failed with status {seed_result.returncode}", artifacts, {"seed_returncode": seed_result.returncode})
+
+        initial_download_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--sync",
+            "--download-only",
+            "--verbose",
+            "--resync",
+            "--resync-auth",
+            "--single-directory",
+            root_name,
+            "--confdir",
+            str(conf_local),
+        ]
+        context.log(f"Executing Test Case {self.case_id} initial download: {command_to_string(initial_download_command)}")
+        initial_download_result = run_command(initial_download_command, cwd=context.repo_root)
+        write_text_file(initial_download_stdout, initial_download_result.stdout)
+        write_text_file(initial_download_stderr, initial_download_result.stderr)
+        if initial_download_result.returncode != 0:
+            return self.fail_result(self.case_id, self.name, f"Initial download failed with status {initial_download_result.returncode}", artifacts, {"initial_download_returncode": initial_download_result.returncode})
+
+        initial_xlsx_error = validate_xlsx_pair(local_xlsx, REVISION_0)
+        initial_pdf_error = validate_pdf_pair(local_pdf, PDF_REVISION_0)
+        initial_image_error = validate_image_set(local_image, IMAGE_REVISION_0)
+        if initial_xlsx_error or initial_pdf_error or initial_image_error:
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Initial download did not establish valid Microsoft-settled XLSX/PDF/image fixtures: XLSX={initial_xlsx_error}; PDF={initial_pdf_error}; IMAGE={initial_image_error}",
+                artifacts,
+                {"initial_download_returncode": initial_download_result.returncode, "initial_xlsx_validation_error": initial_xlsx_error, "initial_pdf_validation_error": initial_pdf_error, "initial_image_validation_error": initial_image_error},
+            )
+
+        # Start the XLSX remote update from the bytes Microsoft actually returned. This preserves
+        # any SharePoint enrichment in the package while changing only the deterministic revision
+        # marker, avoiding false byte-identity assumptions for documentLibrary targets.
+        copy_xlsx_pair(local_xlsx, remote_update_xlsx)
+        mutate_xlsx_pair_revision(remote_update_xlsx, REVISION_0, REVISION_1)
+        copy_pdf_pair(local_pdf, remote_update_pdf)
+        mutate_pdf_pair_revision(remote_update_pdf, PDF_REVISION_0, PDF_REVISION_1)
+        copy_image_set(local_image, remote_update_image)
+        mutate_image_set_revision(remote_update_image, IMAGE_REVISION_0, IMAGE_REVISION_1)
+        remote_update_xlsx_error = validate_xlsx_pair(remote_update_xlsx, REVISION_1)
+        remote_update_pdf_error = validate_pdf_pair(remote_update_pdf, PDF_REVISION_1)
+        remote_update_image_error = validate_image_set(remote_update_image, IMAGE_REVISION_1)
+        if remote_update_xlsx_error or remote_update_pdf_error or remote_update_image_error:
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                f"Prepared remote-update XLSX/PDF/image fixtures are invalid: XLSX={remote_update_xlsx_error}; PDF={remote_update_pdf_error}; IMAGE={remote_update_image_error}",
+                artifacts,
+                {"remote_update_xlsx_validation_error": remote_update_xlsx_error, "remote_update_pdf_validation_error": remote_update_pdf_error, "remote_update_image_validation_error": remote_update_image_error},
+            )
+
+        # Remote-side content change: the local DB remains from the initial download, and the
+        # reproduction sync below is a normal local_first sync, matching the reported user config.
+        remote_update_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--sync",
+            "--upload-only",
+            "--verbose",
+            "--resync",
+            "--resync-auth",
+            "--single-directory",
+            root_name,
+            "--confdir",
+            str(conf_remote),
+        ]
+        context.log(f"Executing Test Case {self.case_id} remote sibling update: {command_to_string(remote_update_command)}")
+        remote_update_result = run_command(remote_update_command, cwd=context.repo_root)
+        write_text_file(remote_update_stdout, remote_update_result.stdout)
+        write_text_file(remote_update_stderr, remote_update_result.stderr)
+        if remote_update_result.returncode != 0:
+            return self.fail_result(self.case_id, self.name, f"Remote update failed with status {remote_update_result.returncode}", artifacts, {"remote_update_returncode": remote_update_result.returncode})
+
+        # The actual reproduction phase must be local_first and must be a normal sync.
+        self._write_config(conf_local / "config", local_root, local_first=True)
+
+        final_command = [
+            context.onedrive_bin,
+            "--display-running-config",
+            "--sync",
+            "--verbose",
+            "--single-directory",
+            root_name,
+            "--confdir",
+            str(conf_local),
+        ]
+        final_returncode, mutation_done, final_stdout_text, final_stderr_text, mutation_details = self._run_sync_with_parent_rename(
+            context=context,
+            command=final_command,
+            sync_root=local_root,
+            root_name=root_name,
+            stdout_file=final_stdout,
+            stderr_file=final_stderr,
+            mutation_log_file=mutation_log,
+        )
+
+        combined_final_output = final_stdout_text + "\n" + final_stderr_text
+        filesystem_error_seen = "The local file system returned an error" in combined_final_output
+        status_zero_seen = "HTTP request returned status code 0" in combined_final_output
+        api_error_seen = "Microsoft OneDrive API returned an error" in combined_final_output
+        wrapped_filesystem_error_seen = "There was a file system error during OneDrive request" in combined_final_output
+        target_download_seen = f"Downloading file: {root_name}/{self.TARGET_RELATIVE}" in combined_final_output
+        target_download_seen_without_root = f"Downloading file: {self.TARGET_RELATIVE}" in combined_final_output
+        parent_download_filesystem_error_seen = (
+            f"Download failed (local file system error): {root_name}/Documents/divers/" in combined_final_output
+        )
+
+        details: dict[str, object] = {
+            "root_name": root_name,
+            "target_relative": target_relative,
+            "notes_relative": notes_relative,
+            "xlsx_relative": xlsx_relative,
+            "pdf_relative": pdf_relative,
+            "image_relative": image_relative,
+            "xlsx_seed": xlsx_seed,
+            "pdf_seed": pdf_seed,
+            "image_seed": image_seed,
+            "xlsx_payload_rows": self.XLSX_PAYLOAD_ROWS,
+            "generated_xlsx_size": int(generated_xlsx["size_bytes"]),
+            "generated_large_xlsx_size": int(generated_xlsx["large_size_bytes"]),
+            "generated_pdf_size": int(generated_pdf["size_bytes"]),
+            "generated_large_pdf_size": int(generated_pdf["large_size_bytes"]),
+            "generated_image_sizes": {k: int(v) for k, v in generated_images.items() if k.endswith("_size_bytes")},
+            "initial_xlsx_validation_error": initial_xlsx_error,
+            "initial_pdf_validation_error": initial_pdf_error,
+            "initial_image_validation_error": initial_image_error,
+            "remote_update_xlsx_validation_error": remote_update_xlsx_error,
+            "remote_update_pdf_validation_error": remote_update_pdf_error,
+            "remote_update_image_validation_error": remote_update_image_error,
+            "seed_returncode": seed_result.returncode,
+            "initial_download_returncode": initial_download_result.returncode,
+            "remote_update_returncode": remote_update_result.returncode,
+            "final_returncode": final_returncode,
+            "local_first_reproduction_phase": True,
+            "final_command": command_to_string(final_command),
+            "mutation_done": mutation_done,
+            "mutation_details": mutation_details,
+            "filesystem_error_seen": filesystem_error_seen,
+            "parent_download_filesystem_error_seen": parent_download_filesystem_error_seen,
+            "status_zero_seen": status_zero_seen,
+            "api_error_seen": api_error_seen,
+            "wrapped_filesystem_error_seen": wrapped_filesystem_error_seen,
+            "target_download_seen": target_download_seen,
+            "target_download_seen_without_root": target_download_seen_without_root,
+            "bad_api_status_zero_classification": bool(status_zero_seen or (api_error_seen and wrapped_filesystem_error_seen)),
+        }
+        self._write_metadata(metadata_file, details)
+
+        if not mutation_done:
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                "tc0063 did not rename the local parent path during the local_first sync download phase",
+                artifacts,
+                details,
+            )
+
+        if details["bad_api_status_zero_classification"]:
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                "Local filesystem race was misreported as a Microsoft OneDrive API / HTTP status 0 error",
+                artifacts,
+                details,
+            )
+
+        # The reproduction must actually reach the local filesystem download error path.
+        if mutation_details.get("process_timeout") or final_returncode == 0 or not (
+            filesystem_error_seen and parent_download_filesystem_error_seen
+        ):
+            return self.fail_result(
+                self.case_id,
+                self.name,
+                "Expected a completed, nonzero sync with a local filesystem download error under the renamed parent",
+                artifacts,
+                details,
+            )
+
+        return self.pass_result(self.case_id, self.name, artifacts, details)

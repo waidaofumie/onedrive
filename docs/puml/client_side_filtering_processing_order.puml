@@ -1,0 +1,38 @@
+@startuml
+title Client-Side Filtering Processing Order
+
+start
+partition "Local filesystem path" {
+  :Path exists?;
+  :check_nosync boundary;
+  :skip_dotfiles;
+  note right
+    With sync_list configured, a dotfile is not
+    immediately rejected because sync_list may
+    explicitly include it.
+  end note
+  :skip_symlinks / invalid symlink validation;
+  :skip_dir / skip_file;
+  :sync_list;
+  :sync_root_files exception for logical-root files;
+  :skip_size;
+}
+
+partition "Online JSON item" {
+  :Required JSON field validation;
+  :Construct logical path context;
+  :skip_dir;
+  :skip_file;
+  :sync_list;
+  :sync_root_files exception;
+  :Create missing parent structure for included items when required;
+  :skip_size;
+}
+
+note right
+  Local-only tests such as .nosync discovery and symbolic-link
+  inspection require filesystem state and therefore are not directly
+  performed by checkJSONAgainstClientSideFiltering().
+end note
+stop
+@enduml

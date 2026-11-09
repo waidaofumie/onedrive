@@ -1,0 +1,65 @@
+@startuml
+title OneDrive Client for Linux - Authentication Paths
+
+participant "OneDrive Client\nfor Linux" as Client
+participant "Local OAuth\nloopback listener" as LocalAuth
+participant "Web Browser / User" as Browser
+participant "Microsoft Identity\nplatform" as Identity
+participant "Intune / broker\nwhen configured" as Intune
+participant "Microsoft Graph API" as Graph
+
+alt Intune broker authentication is configured
+  Client -> Intune: Attempt silent token acquisition from cached account state
+  alt Silent acquisition succeeds
+    Intune --> Client: Access token + expiry/account data
+  else Silent acquisition fails / no cached account
+    Client -> Intune: Start interactive broker authentication
+    Intune -> Identity: Microsoft identity / Conditional Access flow
+    Identity --> Intune: Authentication result
+    Intune --> Client: Access token + expiry/account data
+  end
+else Standard OAuth authentication
+  alt Valid refresh token is available
+    Client -> Identity: Refresh-token grant over HTTPS
+    Identity --> Client: Access token + refresh token / expiry
+  else Device authorisation is configured
+    Client -> Identity: Request device code
+    Identity --> Client: Verification URI + user code + polling interval
+    Client -> Browser: Ask user to visit verification URI and enter code
+    Browser -> Identity: User authentication / consent / MFA if required
+    loop Until authorised, declined or expired
+      Client -> Identity: Poll device-code token endpoint
+      Identity --> Client: Pending / error / token response
+    end
+  else Interactive authorisation code flow
+    alt Local browser callback is available
+      Client -> LocalAuth: Bind available loopback port
+      Client -> Browser: Open Microsoft authorisation URL
+      Browser -> Identity: User authentication / consent / MFA if required
+      Identity --> Browser: Redirect to loopback URI with code
+      Browser -> LocalAuth: GET callback URI
+      LocalAuth --> Client: Authorisation code
+      Client -> Identity: Redeem code at token endpoint
+      Identity --> Client: Access token + refresh token / expiry
+      LocalAuth --> Browser: Authentication completion response
+    else Manual redirect URI workflow
+      Client -> Browser: Display authorisation URL
+      Browser -> Identity: User authentication / consent / MFA if required
+      Identity --> Browser: Redirect URI containing code
+      Browser --> Client: User pastes full redirect URI
+      Client -> Client: Extract authorisation code
+      Client -> Identity: Redeem code at token endpoint
+      Identity --> Client: Access token + refresh token / expiry
+    end
+  end
+end
+
+== Authenticated API operation ==
+Client -> Graph: Microsoft Graph request with bearer access token
+Graph --> Client: API response
+
+opt Access token expires during runtime
+  Client -> Identity: Refresh-token grant or applicable broker renewal
+  Identity --> Client: New access token / expiry
+end
+@enduml

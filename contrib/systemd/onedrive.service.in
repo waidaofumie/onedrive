@@ -1,13 +1,27 @@
 [Unit]
-Description=OneDrive Free Client
+Description=OneDrive Client for Linux
 Documentation=https://github.com/abraunegg/onedrive
-After=network-online.target
+
+# This service is enabled by default.target but intentionally starts after
+# default.target has been reached. DefaultDependencies=no prevents systemd
+# from automatically ordering default.target after this service, which would
+# otherwise create an ordering cycle with After=default.target.
+#
+# Because default dependencies are disabled, explicitly restore the normal
+# basic startup and shutdown relationships for a service unit.
+DefaultDependencies=no
+Requires=basic.target
+After=basic.target network-online.target default.target
 Wants=network-online.target
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
-# Commented out hardenings are disabled because they don't work out of the box.
+# Commented out hardenings are disabled because they may not work out of the box on your distribution
 # If you know what you are doing please try to enable them.
+
 ProtectSystem=full
+#PrivateUsers=true
 #PrivateDevices=true
 ProtectHostname=true
 #ProtectClock=true
@@ -16,10 +30,14 @@ ProtectKernelTunables=true
 #ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictRealtime=true
+ExecStartPre=/bin/sh -c 'sleep 15'
 ExecStart=@prefix@/bin/onedrive --monitor
 Restart=on-failure
 RestartSec=3
-RestartPreventExitStatus=3
+# Do not restart the service if a --resync is required; the client exits with EX_CONFIG (78)
+RestartPreventExitStatus=78
+# Time to wait for the service to stop gracefully before forcefully terminating it
+TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target
